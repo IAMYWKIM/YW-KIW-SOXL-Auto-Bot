@@ -27,6 +27,7 @@ from logger import get_logger
 log = get_logger("kiwoom")
 
 # ── TR ID (응답 오류 시 여기만 수정) ───────────────────────────────
+TR_STEX_LOOKUP = "usa10098"      # 미국주식 거래소구분 조회 (종목코드만으로 조회)
 TR_STOCK_LOOKUP = "usa10100"     # 미국주식 종목 조회 (거래소구분 확인)
 TR_QUOTE = "usa20100"            # 미국주식 현재가 종목정보
 TR_ORDERBOOK = "usa20101"        # 미국주식 현재가 10호가
@@ -54,13 +55,57 @@ PATH_ACCOUNT = "/api/us/acnt"
 PATH_EXCHANGE = "/api/us/exchange"
 
 TRDE_TP_LIMIT = "00"             # 해외매매구분: 00 지정가 (이 봇은 지정가만 사용)
-STEX_CANDIDATES = ("NA", "ND", "NY")   # NA: AMEX, ND: NASDAQ, NY: NYSE
+STEX_CANDIDATES = ("NY", "NA", "ND")   # NA: AMEX, ND: NASDAQ, NY: NYSE
+# 키움 명세 예시에서 확인된 값: SOXL → NY (NYSE Arca 상장 ETF 가 NY 로 분류됨). SGOV 도 NYSE Arca, QQQ 는 NASDAQ.
+KNOWN_STEX = {"SOXL": "NY", "SGOV": "NY", "QQQ": "ND"}
+
+# 키움 오류코드 → 원인 안내 (키움 공식 명세 error_codes)
+ERROR_HINTS = {
+    "8001": "앱키/시크릿키가 틀렸습니다 (.env 확인)",
+    "8002": "앱키/시크릿키가 틀렸습니다 (.env 확인)",
+    "8010": "토큰을 받은 IP와 요청 IP가 다릅니다 — 서버 IP가 바뀌었는지 확인",
+    "8030": "실전/모의 구분이 다른 앱키입니다 — TRADE_MODE 와 키(_MOCK 여부)를 맞추세요",
+    "8031": "실전/모의 구분이 다른 토큰입니다 — TRADE_MODE 와 키를 맞추세요",
+    "8040": "단말기(IP) 인증 실패 — 키움 OpenAPI 포털에 이 서버의 공인 IP를 등록하세요",
+    "8050": "지정단말기 인증 실패 — 키움 OpenAPI 포털에 이 서버의 공인 IP를 등록하세요",
+    "8103": "토큰/단말기 인증 실패 — 서버 공인 IP 등록과 앱키를 확인하세요",
+    "8104": "모의투자에서 지원하지 않는 API 입니다 — 해외주식 모의투자 신청 여부를 확인하거나 DRY_RUN 으로 시험하세요",
+    "8200": "법인 계좌는 이 API를 쓸 수 없습니다",
+    "7": "키움 서버 일시 오류입니다 — 봇이 자동 재시도하고 직전 값으로 이어 갑니다 (계속되면 키움 점검 시간 여부 확인)",
+    "1700": "호출 한도 초과 — KIWOOM.QUERY_MIN_INTERVAL 을 0.34 로",
+    "1903": "종목코드/거래소구분이 맞지 않습니다 — config.json SYMBOLS 확인",
+    "1504": "이 주소에서 지원하지 않는 API ID 입니다",
+    "1505": "존재하지 않는 API ID 입니다 (계정에 해외주식 API 사용 신청이 안 되어 있을 수 있음)",
+}
+
+
+TRANSIENT_CODES = {"7", "1999", "1687"}
+TRANSIENT_WORDS = ("처리하는 중에 오류", "[1631]", "예기치 못한", "일시적", "잠시 후")
+
+
+def is_transient(code, msg: str = "", http_status: int = 200) -> bool:
+    """키움 서버 쪽 일시 오류인지 (재시도·직전값 사용 대상). 실측: return_code=7 '서비스를 처리하는 중에 오류가 발생했습니다[1631]'"""
+    return (str(code) in TRANSIENT_CODES or int(http_status or 200) >= 500
+            or any(w in str(msg) for w in TRANSIENT_WORDS) or str(code) in ("NET", "TIMEOUT"))
+
+
+def hint_for(code, msg: str = "") -> str:
+    c = str(code or "")
+    if c in ERROR_HINTS:
+        return ERROR_HINTS[c]
+    for k, v in ERROR_HINTS.items():
+        if f"[{k}" in str(msg) or f"{k}:" in str(msg):
+            return v
+    return ""
 
 
 class KiwoomApiError(RuntimeError):
     def __init__(self, api_id: str, code, msg: str, http_status: int = 200):
         self.api_id, self.code, self.msg, self.http_status = api_id, code, str(msg or ""), http_status
-        super().__init__(f"{api_id} 오류 return_code={code} http={http_status} msg={self.msg}")
+        self.hint = hint_for(code, self.msg)
+        self.transient = is_transient(code, self.msg, http_status)
+        super().__init__(f"{api_id} 오류 return_code={code} http={http_status} msg={self.msg}"
+                         + (f" → {self.hint}" if self.hint else ""))
 
 
 def fnum(v, default=0.0) -> float:
@@ -79,6 +124,37 @@ def fnum(v, default=0.0) -> float:
     except ValueError:
         return default
     return -f if neg else f
+
+
+def parse_ts14(s: str):
+    """키움 시각 'YYYYMMDDHHMMSS' → datetime (시간대 없음).
+    키움은 자정을 넘긴 주간거래(데이마켓) 체결을 '영업일자 + 24시 이상'으로 적습니다
+    (실측: 2026-11-11 02:33 ET 의 봉 = '20261110263300'). 24 이상이면 다음 날로 넘깁니다."""
+    import re as _re
+    t = _re.sub(r"\D", "", str(s or ""))
+    if len(t) < 12:
+        return None
+    t = (t + "00")[:14]
+    try:
+        base = datetime.strptime(t[:8], "%Y%m%d")
+        hh, mm, ss = int(t[8:10]), int(t[10:12]), int(t[12:14])
+    except ValueError:
+        return None
+    if mm > 59 or ss > 59 or hh > 47:
+        return None
+    return base + timedelta(hours=hh, minutes=mm, seconds=ss)
+
+
+def split_hms(s: str):
+    """'HHMMSS'(HH 는 24 이상 가능) → (추가일수, 시, 분, 초). 형식이 이상하면 None"""
+    import re as _re
+    t = _re.sub(r"\D", "", str(s or ""))
+    if len(t) < 6:
+        return None
+    hh, mm, ss = int(t[0:2]), int(t[2:4]), int(t[4:6])
+    if mm > 59 or ss > 59 or hh > 47:
+        return None
+    return hh // 24, hh % 24, mm, ss
 
 
 def anum(v, default=0.0) -> float:
@@ -182,7 +258,9 @@ class KiwoomUsClient:
             t_start = time.time()
             timeout = float(kcfg.get("TIMEOUT_SEC", 8))
             data, status = {}, 0
-            for attempt in (1, 2):
+            token_retried = False
+            max_try = 1 if is_order else 3          # 주문은 중복 접수 위험이 있어 재시도하지 않습니다
+            for attempt in range(1, max_try + 2):
                 headers = {
                     "Content-Type": "application/json;charset=UTF-8",
                     "authorization": f"Bearer {self._ensure_token()}",
@@ -194,6 +272,13 @@ class KiwoomUsClient:
                     headers["next-key"] = next_key
                 try:
                     r = self._session.post(f"{self.base}{path}", headers=headers, json=body or {}, timeout=timeout)
+                except (requests.Timeout, requests.ConnectionError) as ne:
+                    if is_order or attempt >= max_try:
+                        self.err_by_api[api_id] += 1
+                        raise KiwoomApiError(api_id, "TIMEOUT" if isinstance(ne, requests.Timeout) else "NET",
+                                             f"키움 서버 연결 실패: {type(ne).__name__}")
+                    time.sleep(0.6 * attempt)
+                    continue
                 finally:
                     now = time.time()
                     if is_order:
@@ -208,8 +293,13 @@ class KiwoomUsClient:
                 rc = data.get("return_code")
                 msg = str(data.get("return_msg") or "")
                 # 토큰 만료: HTTP 401 또는 return_code 8005 / 메시지 [8005:...] → 1회 재발급 후 재시도
-                if attempt == 1 and (status == 401 or str(rc) == "8005" or "8005" in msg[:12]):
+                if not token_retried and (status == 401 or str(rc) == "8005" or "8005" in msg[:12]):
+                    token_retried = True
                     self.invalidate_token()
+                    continue
+                if not is_order and attempt < max_try and is_transient(rc, msg, status):
+                    log.info("키움 일시 오류 재시도 %s (%d/%d): %s %s", api_id, attempt, max_try - 1, rc, msg[:60])
+                    time.sleep(0.6 * attempt)
                     continue
                 break
             self._record(api_id, t_req, t_start, time.time())
@@ -254,25 +344,39 @@ class KiwoomUsClient:
         if fixed in STEX_CANDIDATES:
             self._stex_cache[sym] = fixed
             return fixed
+        if sym in KNOWN_STEX:                     # AUTO 여도 명세로 확인된 값이 있으면 그대로 사용
+            self._stex_cache[sym] = KNOWN_STEX[sym]
+            return KNOWN_STEX[sym]
+        errors = []
         try:
-            d = self.request(TR_STOCK_LOOKUP, PATH_STKINFO, {"stex_tp": "", "stk_cd": sym})
+            d = self.request(TR_STEX_LOOKUP, PATH_STKINFO, {"stk_cd": sym})
             got = str(pick(d, "stex_tp", default="") or "").upper()
+            if not got:
+                lst = rows_of(d, "list")
+                got = str(lst[0].get("stex_tp") or "").upper() if lst else ""
             if got in STEX_CANDIDATES:
                 self._stex_cache[sym] = got
-                log.info("거래소구분 확인: %s → %s (%s)", sym, got, pick(d, "mkgb", default=""))
+                log.info("거래소구분 확인(usa10098): %s → %s", sym, got)
                 return got
-        except Exception as e:
-            log.debug("종목 조회(usa10100) 실패, 시세 조회로 거래소구분 탐색: %s", e)
+        except KiwoomApiError as e:
+            if e.api_id == "au10001" or str(e.code).startswith("8"):
+                raise                             # 인증/권한 오류는 그대로 올려 진짜 원인을 보여 줍니다
+            errors.append(f"usa10098: {e.code} {e.msg}")
         for cand in STEX_CANDIDATES:
             try:
-                d = self.request(TR_QUOTE, PATH_MRKCOND, {"stex_tp": cand, "stk_cd": sym})
-                if anum(pick(d, "cur_prc", "base_close_pric")) > 0:
+                d = self.request(TR_STOCK_LOOKUP, PATH_STKINFO, {"stex_tp": cand, "stk_cd": sym})
+                if str(pick(d, "stk_cd", default="")).upper() == sym or pick(d, "stk_nm"):
                     self._stex_cache[sym] = cand
-                    log.info("거래소구분 탐색 결과: %s → %s", sym, cand)
+                    log.info("거래소구분 탐색 결과: %s → %s (%s)", sym, cand, pick(d, "mkgb", default=""))
                     return cand
-            except Exception:
-                continue
-        raise KiwoomApiError(TR_STOCK_LOOKUP, "NO_STEX", f"{sym} 의 거래소구분을 찾지 못했습니다 (config.json SYMBOLS 에 직접 지정)")
+                errors.append(f"usa10100({cand}): 빈 응답")
+            except KiwoomApiError as e:
+                if e.api_id == "au10001" or str(e.code).startswith("8"):
+                    raise
+                errors.append(f"usa10100({cand}): {e.code} {e.msg}")
+        raise KiwoomApiError(TR_STOCK_LOOKUP, "NO_STEX",
+                             f"{sym} 거래소구분을 찾지 못했습니다 (config.json SYMBOLS.{sym} 에 NY/ND/NA 지정). "
+                             f"시도 결과: {' | '.join(errors)[:400]}")
 
     # ── 시세 ───────────────────────────────────────────────────
     def quote(self, symbol: str) -> dict:

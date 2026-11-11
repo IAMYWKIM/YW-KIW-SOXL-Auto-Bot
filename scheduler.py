@@ -11,6 +11,7 @@ kiw_soxl_trader - 백그라운드 작업 (엔진과 같은 asyncio 루프에서 
 """
 import asyncio
 import json
+import time
 from datetime import datetime
 
 import config
@@ -279,9 +280,19 @@ async def health_loop():
 
 def make_api_error_handler(loop):
     """브릿지에서 키움 오류가 나면 기록하고, 같은 오류는 쿨다운을 두고 알립니다."""
-    def _handler(api_id: str, code: str, msg: str):
+    recent = {}                                    # 일시 오류 발생 시각 (api_id → [ts...])
+
+    def _handler(api_id: str, code: str, msg: str, transient: bool = False):
         try:
-            store.add_event("API_ERROR", f"{api_id} {code}", msg)
+            store.add_event("API_ERROR", f"{api_id} {code}" + (" (일시)" if transient else ""), msg)
+            if transient:
+                # 키움 서버 일시 오류는 자동 재시도·직전 값으로 넘어가므로, 10분 안에 3번 이상 반복될 때만 알립니다
+                now = time.time()
+                lst = [t for t in recent.get(api_id, []) if now - t < 600] + [now]
+                recent[api_id] = lst
+                if len(lst) < int(config.get("ALERT.TRANSIENT_REPEAT", 3) or 3):
+                    return
+                msg = f"10분 안에 {len(lst)}회 반복 · " + msg
             if config.get("ALERT.API_ERROR", True) and code not in ("order-hours-closed",):
                 cd = float(config.get("ALERT.API_ERROR_COOLDOWN_MIN", 30) or 30)
                 text = f"⚠️ <b>[키움 API 오류]</b> {api_id}\n{code}\n{str(msg)[:300]}"

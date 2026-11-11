@@ -27,6 +27,7 @@ class Market:
         self.script = None       # callable(t)->price for SOXL
         self.fee = 0.0025
         self.calls = []
+        self.fail = {}           # api_id → 남은 실패 횟수 (일시 오류 재현)
 
     def price(self, sym):
         if sym == "SOXL" and self.script:
@@ -72,11 +73,19 @@ def _q(v):
 def handle(api_id, body):
     m = MKT
     m.calls.append(api_id)
+    if m.fail.get(api_id, 0) > 0:
+        m.fail[api_id] -= 1
+        return {"return_code": 7, "return_msg": "서비스를 처리하는 중에 오류가 발생했습니다[1631]"}
     ok = {"return_code": 0, "return_msg": "정상적으로 처리되었습니다"}
     sym = str(body.get("stk_cd") or "").upper()
     now = datetime.now(ET)
     if api_id == "usa10100":
-        return {"stex_tp": "ND" if sym == "QQQ" else "NA", "stk_cd": sym, "stk_nm": sym, "mkgb": "TEST", **ok}
+        want = "ND" if sym == "QQQ" else "NY"
+        if body.get("stex_tp") and body["stex_tp"] != want:
+            return {"return_code": 1903, "return_msg": f"종목 정보가 없습니다. 거래소구분={body['stex_tp']}, 종목코드={sym}"}
+        return {"stex_tp": want, "stk_cd": sym, "stk_nm": sym, "mkgb": "TEST", **ok}
+    if api_id == "usa10098":
+        return {"list": [{"stex_tp": "ND" if sym == "QQQ" else "NY", "stk_cd": sym}], **ok}
     if api_id == "usa20100":
         p = m.price(sym)
         return {"stk_cd": sym, "stk_nm": sym, "cur_prc": "+" + _f(p), "base_close_pric": _f(p * 0.99),
@@ -93,24 +102,31 @@ def handle(api_id, body):
         return d
     if api_id == "usa20150":
         p = m.price(sym)
-        return {"result_list": [{"cur_prc": "+" + _f(p), "trde_qty": "+5", "cntr_tm": now.strftime("%H%M%S")}], **ok}
+        hh = now.hour + 24 if now.hour < 4 else now.hour
+        return {"result_list": [{"cur_prc": "+" + _f(p), "trde_qty": "+5", "cntr_tm": f"{hh:02d}" + now.strftime("%M%S")}], **ok}
     if api_id == "usa06011":
+        # 실측 형식 재현: 최신→과거, 자정 넘긴 주간거래(00~04시)는 '전 영업일 + 24시 이상'으로 표기
         p = m.price(sym)
         rows = []
         t = now.replace(second=0, microsecond=0)
         for i in range(600):
             tt = t - timedelta(minutes=i)
-            if tt.weekday() >= 5 or not (4 <= tt.hour < 20):
+            if tt.weekday() >= 5 and tt.hour >= 4:
                 continue
             pp = p * (1 + 0.0004 * ((i % 17) - 8))
+            if tt.hour < 4:
+                bd = tt - timedelta(days=1)
+                label = bd.strftime("%Y%m%d") + f"{tt.hour + 24:02d}" + tt.strftime("%M%S")
+            else:
+                bd, label = tt, tt.strftime("%Y%m%d%H%M%S")
             rows.append({"cur_prc": _f(pp), "trde_qty": "1000", "open_pric": _f(pp * 0.999),
                          "high_pric": _f(pp * 1.002), "low_pric": _f(pp * 0.998),
-                         "cntr_tm": tt.strftime("%Y%m%d%H%M%S"), "bus_dt": tt.strftime("%Y%m%d")})
+                         "cntr_tm": label, "bus_dt": bd.strftime("%Y%m%d")})
         return {"result_list": rows, **ok}
     if api_id == "usa06012":
         p = m.price(sym)
         rows = []
-        d = now
+        d = datetime.strptime(str(body.get("strt_dt") or now.strftime("%Y%m%d")), "%Y%m%d")   # 기준일부터 과거로
         while len(rows) < 30:
             if d.weekday() < 5:
                 k = len(rows)

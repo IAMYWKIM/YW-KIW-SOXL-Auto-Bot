@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
-from kiwoom_us_client import (PATH_ACCOUNT, PATH_CHART, TR_MINUTE_CHART, TR_ORDERS_TODAY, KiwoomApiError,
+from kiwoom_us_client import (parse_ts14, PATH_ACCOUNT, PATH_CHART, TR_MINUTE_CHART, TR_ORDERS_TODAY, KiwoomApiError,
                               KiwoomUsClient, rows_of)
 
 ET, KST = ZoneInfo("America/New_York"), ZoneInfo("Asia/Seoul")
@@ -40,6 +40,12 @@ def main() -> int:
     print(f"키움 서버: {k.base} · 모드 {'모의' if config.KIWOOM_IS_MOCK else '실전'}")
     print(f"지금: {datetime.now(KST):%Y-%m-%d %H:%M:%S} KST = {datetime.now(ET):%Y-%m-%d %H:%M:%S} ET")
     advice = {}
+
+    def _ip():
+        import requests
+        ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        print(f"   이 서버의 공인 IP: {ip}  ← 키움 OpenAPI 포털(openapi.kiwoom.com)에 등록된 IP와 같아야 합니다")
+    show("0. 서버 공인 IP", _ip)
 
     if show("1. 접근토큰", lambda: print("   ✅ 발급 성공, 만료", k._ensure_token() and k._token_expire)) is None and not k._token:
         return 1
@@ -91,7 +97,10 @@ def main() -> int:
         tz = "KST" if diff > max(3, len(rows) * 0.05) else "ET"
         print(f"   영업일자와 날짜가 다른 봉 {diff}개 → 분봉 시간대 추정: {tz}")
         advice["KIWOOM.CHART_TZ"] = tz
-        newest = datetime.strptime(tms[-1][:14], "%Y%m%d%H%M%S").replace(tzinfo=ET if tz == "ET" else KST)
+        newest = parse_ts14(tms[-1]).replace(tzinfo=ET if tz == "ET" else KST)
+        late = sum(1 for t in tms if t[8:10] >= "24")
+        if late:
+            print(f"   ℹ️ 24시 이상 표기 봉 {late}개 (자정을 넘긴 주간거래를 영업일자에 붙여 적는 키움 방식) → 봇이 실제 시각으로 변환합니다")
         age = (datetime.now(ET) - newest.astimezone(ET)).total_seconds() / 60
         print(f"   최신 봉은 지금보다 {age:+.1f}분 전 (장중인데 2분 넘게 차이나면 시세 지연 또는 시간대 추정 오류)")
         if -1.5 < age < -0.2:
@@ -102,7 +111,7 @@ def main() -> int:
     show("5. 1분봉 (usa06011) — 가장 중요", _minute)
 
     show("6. 일봉 (usa06012)", lambda: print("   최근 3일:", [(r.get("dt"), r.get("cur_prc")) for r in k.daily_chart(
-        "SOXL", (datetime.now(ET) - timedelta(days=20)).strftime("%Y%m%d"))[:3]]))
+        "SOXL", datetime.now(ET).strftime("%Y%m%d"))[:3]], "← 어제·그제 날짜면 정상"))
     show("7. 달러 예수금 (ust21110)", lambda: print("  ", {a: b for a, b in k.deposit_usd().items() if a != "raw"}))
 
     def _hold():

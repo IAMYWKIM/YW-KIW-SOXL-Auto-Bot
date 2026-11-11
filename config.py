@@ -100,8 +100,8 @@ CONFIG_JSON = BASE_DIR / "config.json"
 DEFAULTS = {
     "_README": "값 저장 즉시 반영됩니다. 전략 수치는 engine/ 원본 소스가 결정하며 여기서는 키움 연결·기록·보고·안전장치만 다룹니다.",
     "SYMBOLS": {
-        "_README": "종목별 키움 거래소구분(stex_tp). NA=AMEX(NYSE Arca 포함), ND=NASDAQ, NY=NYSE. diag.py 로 확인 후 고정하세요. AUTO 는 순서대로 시도합니다.",
-        "SOXL": "AUTO", "SGOV": "AUTO", "QQQ": "AUTO",
+        "_README": "종목별 키움 거래소구분(stex_tp). NA=AMEX, ND=NASDAQ, NY=NYSE(키움은 NYSE Arca 상장 ETF 인 SOXL·SGOV 를 NY 로 분류). AUTO 는 자동 탐색합니다.",
+        "SOXL": "NY", "SGOV": "NY", "QQQ": "ND",
     },
     "FEE": {
         "_README": "편도 수수료율(소수). 0.0025 = 0.25%. 본인 계좌의 실제 미국주식 수수료율로 반드시 맞추세요 (엔진의 순익·익절 계산에 쓰입니다). 엔진 허용 범위는 0 초과 0.01 이하.",
@@ -145,8 +145,8 @@ DEFAULTS = {
         "ENABLED": None, "DAILY": True, "WEEKLY": True, "MONTHLY": True, "ATTACH_EXCEL": True,
     },
     "ALERT": {
-        "_README": "봇 자체 알림. FILL=체결 요약(원본 엔진 알림과 별개의 한 줄 기록), API_ERROR_COOLDOWN_MIN=같은 API 오류 알림 간격.",
-        "FILL": False, "API_ERROR": True, "API_ERROR_COOLDOWN_MIN": 30,
+        "_README": "봇 자체 알림. FILL=체결 요약(원본 엔진 알림과 별개의 한 줄 기록), API_ERROR_COOLDOWN_MIN=같은 API 오류 알림 간격, TRANSIENT_REPEAT=키움 서버 일시 오류는 10분 안에 이 횟수 이상 반복될 때만 알림.",
+        "FILL": False, "API_ERROR": True, "API_ERROR_COOLDOWN_MIN": 30, "TRANSIENT_REPEAT": 3,
         "STALE_CANDLE_MIN": 5,
     },
 }

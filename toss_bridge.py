@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 
 import config
 import store
-from kiwoom_us_client import KiwoomApiError, KiwoomUsClient, anum
+from kiwoom_us_client import KiwoomApiError, KiwoomUsClient, anum, parse_ts14, split_hms
 from logger import get_logger
 
 log = get_logger("bridge")
@@ -124,7 +124,8 @@ class TossBridge:
                 code = self._map_error(e)
                 if self.on_api_error:
                     try:
-                        self.on_api_error(e.api_id, code, e.msg)
+                        self.on_api_error(e.api_id, code, e.msg + (f"\n💡 {e.hint}" if e.hint else ""),
+                                          getattr(e, "transient", False))
                     except Exception:
                         pass
                 raise self._err(e.http_status if e.http_status >= 400 else 422, code, f"[키움 {e.api_id}] {e.msg}")
@@ -149,6 +150,9 @@ class TossBridge:
     async def _call(self, fn, *args, **kw):
         return await asyncio.to_thread(fn, *args, **kw)
 
+    # 일시 오류 때 직전 값을 대신 써도 되는 조회와 그 허용 나이(초). 현재가·잔고·주문 조회는 대상이 아닙니다.
+    STALE_OK = {"d1:": 3 * 86400, "fx": 86400, "tk:": 15, "ob:": 5}
+
     async def _cached(self, key: str, ttl: float, fn, *args, **kw):
         hit = self._cache.get(key)
         now = time.monotonic()
@@ -159,7 +163,15 @@ class TossBridge:
             hit = self._cache.get(key)
             if hit and time.monotonic() - hit[0] < ttl:
                 return hit[1]
-            val = await self._call(fn, *args, **kw)
+            try:
+                val = await self._call(fn, *args, **kw)
+            except KiwoomApiError as e:
+                max_age = next((v for p, v in self.STALE_OK.items() if key.startswith(p)), 0)
+                if hit and getattr(e, "transient", False) and time.monotonic() - hit[0] < max_age:
+                    log.warning("키움 일시 오류로 직전 값 사용 (%s, %.0f초 전 값): %s", key,
+                                time.monotonic() - hit[0], e.msg[:80])
+                    return hit[1]
+                raise
             self._cache[key] = (time.monotonic(), val)
             return val
 
@@ -225,13 +237,11 @@ class TossBridge:
         now_l = datetime.now(tz)
         out = []
         for r in rows[:cnt]:
-            tm = re.sub(r"\D", "", r["tm"])
-            if r["price"] <= 0 or len(tm) < 6:
-                continue
-            try:
-                dt = now_l.replace(hour=int(tm[0:2]), minute=int(tm[2:4]), second=int(tm[4:6]), microsecond=0)
-            except ValueError:
+            hms = split_hms(r["tm"])
+            if r["price"] <= 0 or hms is None:
                 continue          # 시각 형식이 이상한 행은 버립니다 (엔진은 5초 이내 체결만 사용)
+            _, hh, mm, ss = hms   # 24시 이상(자정 넘긴 주간거래)은 오늘 날짜의 0시대로
+            dt = now_l.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             if dt > now_l + timedelta(minutes=2):
                 dt -= timedelta(days=1)
             out.append({"price": f"{r['price']:.4f}", "volume": str(int(r["volume"]) or 1),
@@ -239,17 +249,28 @@ class TossBridge:
         return out
 
     async def _r_fx(self, params, body):
+        errs = []
         try:
             rate = await self._cached("fx", 60.0, self.kiw.fx_rate)
-        except KiwoomApiError:
+        except KiwoomApiError as e:
             rate = 0.0
+            errs.append(f"ust31301: {e.code} {e.msg}" + (f" → {e.hint}" if e.hint else ""))
+            if e.api_id == "au10001" or str(e.code).startswith("8"):
+                raise
         if rate <= 100:
             try:
                 rate = (await self.quote("SOXL")).get("fx", 0.0)
-            except KiwoomApiError:
+            except KiwoomApiError as e:
                 rate = 0.0
+                errs.append(f"usa20100: {e.code} {e.msg}" + (f" → {e.hint}" if e.hint else ""))
         if rate <= 100:
-            raise KiwoomApiError("ust31301", "NO_FX", "환율 조회 실패")
+            fb = float(store.kv_get("last_fx_rate", 0) or 0)
+            if fb > 100:                       # 마지막으로 성공한 환율로 대신 (환율은 원화 환산 표시에만 쓰입니다)
+                rate = fb
+            else:
+                raise KiwoomApiError("ust31301", "NO_FX", "환율 조회 실패 — " + (" | ".join(errs) or "응답에 환율 없음"))
+        else:
+            store.kv_set("last_fx_rate", rate)
         return {"baseCurrency": "USD", "quoteCurrency": "KRW", "rate": f"{rate:.2f}", "midRate": f"{rate:.2f}"}
 
     # ── 분봉 시간대 판정 ──────────────────────────────────────
@@ -323,17 +344,11 @@ class TossBridge:
                 return store_
             first = len(store_) < 60
             max_pages = int(self._k("CANDLE_MAX_PAGES", 4))
+            # 실측(2026-11-11): 시작일자(strt_dt)=그 날짜부터 과거로 거슬러 올라가는 기준일, 응답은 최신→과거 100봉씩.
+            # 오늘(ET) 날짜를 주고 첫 기동 때만 여러 페이지(=400봉), 이후엔 최신 1페이지만 받아 덧붙입니다.
             today = datetime.now(ET).strftime("%Y%m%d")
             try:
-                # 시작일자(strt_dt)의 뜻(기준일/하한일)과 정렬 방향이 명세에 없어, 어느 쪽이어도 최신 봉을 얻도록 조회합니다.
                 rows = await self._call(self.kiw.minute_chart, sym, today, max_pages if first else 1)
-                if first and len(rows) < 200:        # 오늘 봉만 왔다면 며칠 전부터 한 번 더 받아 지표 예열분 확보
-                    old = (datetime.now(ET) - timedelta(days=6)).strftime("%Y%m%d")
-                    rows += await self._call(self.kiw.minute_chart, sym, old, max_pages)
-                elif not first and rows and store_:
-                    newest_in_page = max(re.sub(r"\D", "", _s(r.get("cntr_tm")))[:12] for r in rows)
-                    if newest_in_page < max(store_)[:12]:   # 과거→최신 순으로 오는 경우: 뒤 페이지까지 받아 최신 봉 확보
-                        rows += await self._call(self.kiw.minute_chart, sym, today, max_pages)
             except KiwoomApiError as e:
                 if store_:
                     log.debug("분봉 갱신 실패(기존 캐시 유지) %s: %s", sym, e)
@@ -344,15 +359,11 @@ class TossBridge:
             tz = self._tz()
             end_label = bool(self._k("CANDLE_TIME_IS_END", False))
             for r in rows:
-                tm = re.sub(r"\D", "", _s(r.get("cntr_tm")))[:14]
                 c = anum(r.get("cur_prc"))
-                if len(tm) < 12 or c <= 0:
+                naive = parse_ts14(_s(r.get("cntr_tm")))     # 24시 이상 표기(자정 넘긴 주간거래)도 실제 시각으로
+                if naive is None or c <= 0:
                     continue
-                tm = (tm + "00")[:14]
-                try:
-                    dt = datetime.strptime(tm, "%Y%m%d%H%M%S").replace(second=0, tzinfo=tz)
-                except ValueError:
-                    continue
+                dt = naive.replace(second=0, tzinfo=tz)
                 if end_label:
                     dt -= timedelta(minutes=1)
                 key = dt.strftime("%Y%m%d%H%M%S")
@@ -369,7 +380,7 @@ class TossBridge:
             return store_
 
     async def _daily_candles(self, sym: str, count: int) -> list:
-        start = (datetime.now(ET) - timedelta(days=max(40, count * 2 + 20))).strftime("%Y%m%d")
+        start = datetime.now(ET).strftime("%Y%m%d")      # 실측: 시작일자 = 이 날짜부터 과거로 (예전 날짜를 주면 그때까지의 봉만 옴)
         rows = await self._cached(f"d1:{sym}", float(self._k("CANDLE_1D_CACHE_SEC", 300)),
                                   self.kiw.daily_chart, sym, start)
         out = {}
