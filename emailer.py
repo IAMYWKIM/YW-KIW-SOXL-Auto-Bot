@@ -14,7 +14,8 @@ log = get_logger("email")
 
 def configured() -> bool:
     return bool(config.SMTP_USER and config.SMTP_PASSWORD and config.EMAIL_TO
-                and "앱비밀번호" not in config.SMTP_PASSWORD and "@" in config.SMTP_USER)
+                and "앱비밀번호" not in config.SMTP_PASSWORD and "@" in config.SMTP_USER
+                and "보내는계정" not in config.SMTP_USER)
 
 
 def auto_enabled(kind: str) -> bool:
@@ -48,12 +49,12 @@ def send(subject: str, text: str, attachments=None) -> tuple:
     try:
         if int(config.SMTP_PORT) == 465:
             with smtplib.SMTP_SSL(config.SMTP_HOST, 465, context=ssl.create_default_context(), timeout=30) as s:
-                s.login(config.SMTP_USER, config.SMTP_PASSWORD)
+                s.login(config.SMTP_USER, config.SMTP_PASSWORD.replace(" ", ""))
                 s.send_message(msg)
         else:
             with smtplib.SMTP(config.SMTP_HOST, int(config.SMTP_PORT), timeout=30) as s:
                 s.starttls(context=ssl.create_default_context())
-                s.login(config.SMTP_USER, config.SMTP_PASSWORD)
+                s.login(config.SMTP_USER, config.SMTP_PASSWORD.replace(" ", ""))
                 s.send_message(msg)
         log.info("이메일 발송 완료: %s → %s", subject, config.EMAIL_TO)
         return True, f"발송 완료 → {', '.join(config.EMAIL_TO)}"

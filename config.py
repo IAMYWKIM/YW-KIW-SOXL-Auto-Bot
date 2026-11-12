@@ -86,7 +86,9 @@ SMTP_HOST = _get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(_get("SMTP_PORT", "465") or 465)
 SMTP_USER = _get("SMTP_USER")
 SMTP_PASSWORD = _get("SMTP_PASSWORD")
-EMAIL_TO = [x.strip() for x in _get("EMAIL_TO").split(",") if x.strip()]
+EMAIL_TO = [x.strip() for x in _get("EMAIL_TO").split(",") if x.strip() and "받는주소" not in x]
+if not EMAIL_TO and SMTP_USER and "@" in SMTP_USER and "보내는계정" not in SMTP_USER:
+    EMAIL_TO = [SMTP_USER]          # 받는 사람을 비워 두면 보내는 계정(본인)으로 받음
 EMAIL_ENABLED_ENV = _get_bool("EMAIL_ENABLED", False)
 
 BOT_LABEL = _get("BOT_LABEL", "키움 해외주식 SOXL 스나이퍼 봇 #1 (KIW_SOXL)")
@@ -145,8 +147,9 @@ DEFAULTS = {
         "ENABLED": None, "DAILY": True, "WEEKLY": True, "MONTHLY": True, "ATTACH_EXCEL": True,
     },
     "ALERT": {
-        "_README": "봇 자체 알림. FILL=체결 요약(원본 엔진 알림과 별개의 한 줄 기록), API_ERROR_COOLDOWN_MIN=같은 API 오류 알림 간격, TRANSIENT_REPEAT=키움 서버 일시 오류는 10분 안에 이 횟수 이상 반복될 때만 알림.",
+        "_README": "봇 자체 알림. FILL=체결 요약(원본 엔진 알림과 별개의 한 줄 기록), API_ERROR_COOLDOWN_MIN=같은 API 오류 알림 간격, TRANSIENT_REPEAT=키움 서버 일시 오류는 10분 안에 이 횟수 이상 반복될 때만 알림, STARTUP_RADAR=기동 직후 스나이퍼 레이더 화면 자동 발송.",
         "FILL": False, "API_ERROR": True, "API_ERROR_COOLDOWN_MIN": 30, "TRANSIENT_REPEAT": 3,
+        "STARTUP_RADAR": True,
         "STALE_CANDLE_MIN": 5,
     },
 }
