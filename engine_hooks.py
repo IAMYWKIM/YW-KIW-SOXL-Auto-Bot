@@ -30,6 +30,7 @@ log = get_logger("hooks")
 # (모듈, 클래스 또는 None, 속성) — 원본에서 이 이름이 사라지면 engine_sync 가 경고합니다
 HOOK_TARGETS = (
     ("toss_api", "TossApiClient", "_request"),
+    ("toss_api", "TossApiClient", "_ensure_access_token"),
     ("toss_api", None, "_NonRetryableApiError"),
     ("plugin_updater", None, "execute_git_pull_and_preflight"),
     ("plugin_updater", None, "run_auto_update_loop"),
@@ -95,6 +96,10 @@ def _set_engine_env() -> None:
     fee = float(config.get("FEE.US_COMMISSION_RATE", 0.0025) or 0.0025)
     os.environ["US_COMMISSION_RATE"] = f"{min(max(fee, 0.000001), 0.01):.6f}"
     os.environ.pop("ROUND_TRIP_FEE_RATE_PCT", None)
+    # 원본 v18(Case 98) /dev/shm 공유 버스: 같은 서버의 봇끼리 시세·캔들·암살자 10G 신호를 나눠 씀.
+    # 기본 폴더(/dev/shm/toss_sniper_bus_v3)는 토스봇과 겹치므로 키움판 전용 폴더로 분리 (.env 로 지정하면 그 값 우선)
+    os.environ.setdefault("TOSS_SHM_BUS_DIR",
+                          str(config.get("KIWOOM.SHM_BUS_DIR", "/dev/shm/kiw_soxl_bus_v3") or "/dev/shm/kiw_soxl_bus_v3"))
     if config.TELEGRAM_ENABLED and config.TELEGRAM_BOT_TOKEN:
         os.environ["TELEGRAM_BOT_TOKEN"] = config.TELEGRAM_BOT_TOKEN
         os.environ["TELEGRAM_CHAT_ID"] = config.TELEGRAM_CHAT_ID

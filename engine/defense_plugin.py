@@ -70,6 +70,7 @@ from sniper_exit_plugin import (
     is_within_post_sell_time_shield,
     mark_extended_sell_restriction_cooldown,
     mark_post_sell_time_shield,
+    reset_sniper_l1_trail_slots,
     sync_pending_sell_order_plugin,
 )
 from sniper_plugin import (
@@ -179,9 +180,10 @@ async def _sync_barbell_sgov_holdings_if_idle(
         bst.get("sgov_sell_order_id") or ""
     ).strip():
         return
-    if (
-        time.monotonic() - safe_float(bst.get("last_sgov_action_mono"), 0.0)
-    ) < 15.0:
+    # MODIFIED: VM 재부팅 시 last_sgov_action_mono 역전으로 인한 영구 스킵 방지
+    now_sg_m = time.monotonic()
+    last_sg_m = safe_float(bst.get("last_sgov_action_mono"), 0.0)
+    if 0.0 < last_sg_m <= now_sg_m and (now_sg_m - last_sg_m) < 15.0:
         return
 
     sg_h = holdings.get(BARBELL_SAFE_SYMBOL)
@@ -198,7 +200,38 @@ async def _sync_barbell_sgov_holdings_if_idle(
         upd_sg["sgov_last_price"] = round(sg_last, 4)
 
     if h_sg_qty != l_sg_qty:
+        old_sg_inv = (
+            safe_float(bst.get("sgov_invested_usd"), 0.0)
+            if l_sg_qty > 0
+            else 0.0
+        )
+        cur_cash_b = max(0.0, safe_float(bst.get("cash_bucket_usd"), 0.0))
+        cur_pend_b = max(
+            0.0, safe_float(bst.get("pending_sgov_buy_budget_usd"), 0.0)
+        )
+        st_soxl_sg = context.ledger.get_state(TARGET_SYMBOL)
+        init_seed_sg = max(
+            100.0,
+            safe_float(
+                st_soxl_sg.get("initial_seed_usd"),
+                safe_float(bst.get("initial_seed_usd"), DEFAULT_INITIAL_SEED_USD),
+            ),
+        )
+        sgov_30_sg = round(init_seed_sg * 0.30, 4)
+        cash_10_sg = round(init_seed_sg * 0.10, 4)
+        rt_sg = resolve_effective_round_trip_fee_rate_pct(
+            state_dict=st_soxl_sg
+        )
+        # MODIFIED [Case 100]: 수동 SGOV 매도 동기화 시 합산 유동성 100% 1회분 회복 기준으로 매도예약 해제
+        guard_floor_sg = round(
+            init_seed_sg * 0.60 * 0.08 * (1.0 + rt_sg / 100.0), 4
+        )
+        soxl_free_sg = max(
+            0.0, safe_float(st_soxl_sg.get("free_cash_usd"), 0.0)
+        )
+
         if h_sg_qty <= 0:
+            new_sg_inv = 0.0
             upd_sg["sgov_held_qty"] = 0
             upd_sg["sgov_avg_price"] = 0.0
             upd_sg["sgov_invested_usd"] = 0.0
@@ -208,11 +241,48 @@ async def _sync_barbell_sgov_holdings_if_idle(
             sg_pur = safe_float(
                 sg_h.get("purchase_amount"), float(h_sg_qty) * sg_avg
             )
+            new_sg_inv = round(max(1.0, sg_pur), 4)
             upd_sg["sgov_held_qty"] = h_sg_qty
-            upd_sg["sgov_invested_usd"] = round(max(1.0, sg_pur), 4)
+            upd_sg["sgov_invested_usd"] = new_sg_inv
             upd_sg["sgov_avg_price"] = round(
-                upd_sg["sgov_invested_usd"] / float(h_sg_qty), 4
+                new_sg_inv / float(h_sg_qty), 4
             )
+
+        if h_sg_qty < l_sg_qty:
+            freed_sg_usd = max(0.0, old_sg_inv - new_sg_inv)
+            max_liq_sg = max(
+                0.0, (cash_10_sg + sgov_30_sg) - new_sg_inv - cur_pend_b
+            )
+            next_cash_sg = round(min(max_liq_sg, cur_cash_b + freed_sg_usd), 4)
+            upd_sg["cash_bucket_usd"] = next_cash_sg
+            if (soxl_free_sg + next_cash_sg + cur_pend_b) >= (
+                guard_floor_sg - 1e-6
+            ):
+                upd_sg["pending_sgov_tranche_sells"] = 0
+                upd_sg["sgov_wait_alert_sent"] = False
+        else:
+            added_sg_usd = max(0.0, new_sg_inv - old_sg_inv)
+            take_pend = min(cur_pend_b, added_sg_usd)
+            rem_take = max(0.0, added_sg_usd - take_pend)
+            next_pend_sg = round(
+                min(
+                    max(0.0, cur_pend_b - take_pend),
+                    max(0.0, sgov_30_sg - new_sg_inv),
+                ),
+                4,
+            )
+            next_cash_sg = round(max(0.0, cur_cash_b - rem_take), 4)
+            ref_sg_p = (
+                sg_last
+                if sg_last > 1.0
+                else max(1.0, safe_float(bst.get("sgov_last_price"), 100.30))
+            )
+            if 0.0 < next_pend_sg < (ref_sg_p * 1.002):
+                next_cash_sg = round(next_cash_sg + next_pend_sg, 4)
+                next_pend_sg = 0.0
+            upd_sg["pending_sgov_buy_budget_usd"] = next_pend_sg
+            upd_sg["cash_bucket_usd"] = next_cash_sg
+
     if upd_sg:
         await b_ledger.update_state(**upd_sg)
 
@@ -486,18 +556,21 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
         )
 
+        # MODIFIED: 수동 부분손절 후 전량매도 시 사이클 순흑자 초과분만 금고 격리
+        prev_cyc_z = safe_float(st.get("cycle_realized_net_usd"), 0.0)
+        vault_delta_z = round(
+            max(0.0, net_pnl + min(0.0, prev_cyc_z)), 4
+        )
         prev_vault_locked = max(
             0.0, safe_float(st.get("vaulted_profit_locked_usd"), 0.0)
         )
         next_vault_locked = (
-            round(prev_vault_locked + max(0.0, net_pnl), 4)
+            round(prev_vault_locked + vault_delta_z, 4)
             if is_barbell
             else prev_vault_locked
         )
 
-        final_cyc_net = round(
-            safe_float(st.get("cycle_realized_net_usd"), 0.0) + net_pnl, 4
-        )
+        final_cyc_net = round(prev_cyc_z + net_pnl, 4)
         final_cyc_ev = max(0, safe_int(st.get("cycle_sell_events"), 0)) + 1
         next_comp_main_cycles = (
             max(0, safe_int(st.get("completed_main_cycles"), 0)) + 1
@@ -517,7 +590,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         next_inj_res_usd = cur_inj_res_usd
         next_used_res_cnt = cur_used_res_cnt
 
-        if cur_inj_res_usd > 0.0:
+        if (not is_barbell) and cur_inj_res_usd > 0.0:
             repay_info = compute_reserve_repayment_on_zero(
                 initial_seed_usd=init_seed,
                 cumulative_realized_net_usd=cum_net,
@@ -646,10 +719,18 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         barbell_vault_total = next_vault_locked
         if is_barbell:
             b_rec = await record_barbell_realized_profit(
-                context=context, net_pnl_usd=net_pnl, is_graduated_zero=True
+                context=context,
+                net_pnl_usd=vault_delta_z,  # MODIFIED: 유령현금 이중계상 차단
+                is_graduated_zero=True,
+                prev_soxl_injected_usd=cur_inj_res_usd,
+                prev_soxl_used_portions_cnt=cur_used_res_cnt,
+                cycle_realized_net_override=final_cyc_net,
             )
             barbell_vault_total = safe_float(
                 b_rec.get("vault_realized_profit_usd"), next_vault_locked
+            )
+            repaid_this_time = safe_float(
+                b_rec.get("repaid_from_soxl_usd"), 0.0
             )
             updated_st = context.ledger.get_state(TARGET_SYMBOL)
 
@@ -779,8 +860,22 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             )
             vault_seed = _resolve_valid_seed_from_state(vault_st)
 
-            if vault_qty == h_qty and (
-                len(vault_buckets) > 0 or len(vault_sub_buckets) > 0
+            is_fresh_empty_ledger = bool(
+                safe_int(st.get("total_buy_events"), 0) == 0
+                and safe_int(st.get("total_sell_events"), 0) == 0
+                and safe_int(st.get("completed_main_cycles"), 0) == 0
+                and safe_float(st.get("last_cycle_end_ts"), 0.0) <= 0.0
+            )
+            vault_not_older = bool(
+                safe_int(vault_st.get("total_sell_events"), 0)
+                >= safe_int(st.get("total_sell_events"), 0)
+                and safe_int(vault_st.get("completed_main_cycles"), 0)
+                >= safe_int(st.get("completed_main_cycles"), 0)
+            )
+            if (
+                (is_fresh_empty_ledger or vault_not_older)
+                and vault_qty == h_qty
+                and (len(vault_buckets) > 0 or len(vault_sub_buckets) > 0)
             ):
                 vault_lots = sum(max(1, b.lot_count) for b in vault_buckets)
                 vault_ratchet_lots = (
@@ -834,6 +929,9 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 else:
                     restored_kw["sub_l1_target_quota_qty"] = 0
 
+                reset_sniper_l1_trail_slots(
+                    context, grid_kind="ALL", symbol=TARGET_SYMBOL
+                )
                 await context.ledger.update_state(TARGET_SYMBOL, **restored_kw)
                 return {
                     "status": "RESTORED_FROM_BACKUP_VAULT",
@@ -981,9 +1079,14 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             "last_reentry_eval_ts": 0.0,
             "last_sub_reentry_eval_ts": 0.0,
         }
-        if isinstance(vault_st, dict):
+        is_ledger_brand_new = bool(
+            safe_int(st.get("total_buy_events"), 0) == 0
+            and safe_int(st.get("total_sell_events"), 0) == 0
+            and safe_int(st.get("completed_main_cycles"), 0) == 0
+            and safe_float(st.get("last_cycle_end_ts"), 0.0) <= 0.0
+        )
+        if isinstance(vault_st, dict) and is_ledger_brand_new:
             for stat_k in (
-                "portion_mode",
                 "vaulted_profit_locked_usd",
                 "us_commission_rate",
                 "round_trip_fee_rate_pct",
@@ -992,12 +1095,6 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 "cumulative_realized_fee_usd",
                 "cumulative_leftover_saved_usd",
                 "cumulative_reanchor_drop_usd",
-                "cycle_realized_gross_usd",
-                "cycle_realized_fee_usd",
-                "cycle_realized_net_usd",
-                "cycle_sub_realized_net_usd",
-                "cycle_sell_events",
-                "cycle_leftover_saved_usd",
                 "last_cycle_realized_net_usd",
                 "last_cycle_sell_events",
                 "completed_main_cycles",
@@ -1005,9 +1102,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 "indiv_grid_sell_cnt",
                 "wma_grad_sell_cnt",
                 "seed_protect_pass_cnt",
-                "daily_seed_protect_pass_cnt",
                 "cond_unlock_buy_events",
-                "daily_unlock_buy_events",
                 "sub_buy_events",
                 "sub_buy_shares",
                 "sub_sell_events",
@@ -1019,22 +1114,15 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 "sub_realized_gross_usd",
                 "sub_realized_fee_usd",
                 "sub_realized_net_usd",
-                "used_reserve_portions_cnt",
-                "injected_reserve_usd",
                 "total_reserve_injected_cnt",
-                "daily_reserve_injected_cnt",
                 "cumulative_reserve_repaid_usd",
                 "dust_guard_blocked_cnt",
-                "daily_dust_guard_blocked_cnt",
                 "extra_13plus_buy_events",
                 "total_buy_events",
                 "total_sell_events",
                 "win_sell_events",
             ):
-                if stat_k == "portion_mode":
-                    if vault_st.get("portion_mode"):
-                        update_kw["portion_mode"] = vault_st["portion_mode"]
-                elif safe_float(st.get(stat_k), 0.0) == 0.0 and safe_float(
+                if safe_float(st.get(stat_k), 0.0) == 0.0 and safe_float(
                     vault_st.get(stat_k), 0.0
                 ) != 0.0:
                     update_kw[stat_k] = vault_st[stat_k]
@@ -1173,8 +1261,18 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             1 if new_held_lots > BASE_MAX_LOTS_8PCT else 0
         )
 
+        # MODIFIED: 1층 공석 유지 상태에서 상단층 수동 편입 시 기존 재장전 anchor_price 보존
         eff_l1_anchor_p = (
-            merged_buckets[0].book_price if merged_buckets else est_buy_p
+            merged_buckets[0].book_price
+            if (merged_buckets and has_active_l1_bucket(merged_buckets))
+            else (
+                safe_float(st.get("anchor_price"), 0.0)
+                or (
+                    merged_buckets[0].book_price
+                    if merged_buckets
+                    else est_buy_p
+                )
+            )
         )
         old_min_p = safe_float(st.get("cycle_min_buy_price"), 0.0)
         new_min_p = (
@@ -1254,7 +1352,11 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         )
         if hasattr(context, "send_slim_alert"):
             if not prev_had_active_l1:
-                pos_desc = "공석 1층 독립 편입(상단 비병합)"
+                pos_desc = (
+                    "공석 1층 독립 편입(상단 비병합)"
+                    if has_active_l1_bucket(merged_buckets)
+                    else f"1층 공석 유지 · 상단 2~{len(merged_buckets) + 1}층 단가비교 편입"
+                )
             elif is_mid_tier_inserted:
                 pos_desc = f"상단 2~{len(merged_buckets)}층 단가비교 중간편입"
             else:
@@ -1499,11 +1601,16 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
     )
 
+    # MODIFIED: 수동 부분손절 후 부분익절 시 사이클 결손 우선 보전
+    prev_cyc_p = safe_float(st.get("cycle_realized_net_usd"), 0.0)
+    vault_delta_p = round(
+        max(0.0, net_pnl + min(0.0, prev_cyc_p)), 4
+    )
     prev_vault_locked_p = max(
         0.0, safe_float(st.get("vaulted_profit_locked_usd"), 0.0)
     )
     next_vault_locked_p = (
-        round(prev_vault_locked_p + max(0.0, net_pnl), 4)
+        round(prev_vault_locked_p + vault_delta_p, 4)
         if is_barbell
         else prev_vault_locked_p
     )
@@ -1645,13 +1752,32 @@ async def reconcile_stratum_with_broker_holdings_plugin(
     )
 
     barbell_vault_part = next_vault_locked_p
+    repaid_part_soxl = 0.0
+    added_part_sgov = 0.0
+    cash_b_part = 0.0
     if is_barbell:
         b_rec_p = await record_barbell_realized_profit(
-            context=context, net_pnl_usd=net_pnl, is_graduated_zero=False
+            context=context,
+            net_pnl_usd=vault_delta_p,  # MODIFIED: 유령현금 이중계상 차단
+            is_graduated_zero=False,
+            prev_soxl_injected_usd=safe_float(
+                st.get("injected_reserve_usd"), 0.0
+            ),
+            prev_soxl_used_portions_cnt=safe_int(
+                st.get("used_reserve_portions_cnt"), 0
+            ),
+            cycle_realized_net_override=cur_cyc_net,
         )
         barbell_vault_part = safe_float(
             b_rec_p.get("vault_realized_profit_usd"), next_vault_locked_p
         )
+        repaid_part_soxl = safe_float(
+            b_rec_p.get("repaid_from_soxl_usd"), 0.0
+        )
+        added_part_sgov = safe_float(
+            b_rec_p.get("added_sgov_buy_budget_usd"), 0.0
+        )
+        cash_b_part = safe_float(b_rec_p.get("cash_bucket_usd"), 0.0)
         updated_st = context.ledger.get_state(TARGET_SYMBOL)
 
     free_cash_now = safe_float(updated_st.get("free_cash_usd"), 0.0)
@@ -1671,8 +1797,18 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             else ""
         )
         if is_barbell:
+            rt_part_note = (
+                f" · ⚡실시간환수 ${repaid_part_soxl:,.0f}(현금 ${cash_b_part:,.0f}"
+                + (
+                    f"·SGOV예약 +${added_part_sgov:,.0f})"
+                    if added_part_sgov > 0.0
+                    else ")"
+                )
+                if repaid_part_soxl > 0.0
+                else ""
+            )
             part_credit_note = (
-                f"별도 수익금고 격리(⚖️바벨 · 누적금고 +${barbell_vault_part:,.2f})"
+                f"별도 수익금고 격리(⚖️바벨 · 누적금고 +${barbell_vault_part:,.2f}){rt_part_note}"
             )
         elif is_simple_mode:
             part_credit_note = (
@@ -1873,6 +2009,9 @@ async def execute_0400_premarket_stabilization_plugin(
     mark_reserve_deposit_check_shield(
         context=context, symbol=TARGET_SYMBOL, clear_shield=True
     )
+    reset_sniper_l1_trail_slots(
+        context, grid_kind="ALL", symbol=TARGET_SYMBOL
+    )
     mark_extended_sell_restriction_cooldown(
         context=context, symbol=TARGET_SYMBOL, cooldown_sec=0.0, reason="CLEAR"
     )
@@ -1882,20 +2021,32 @@ async def execute_0400_premarket_stabilization_plugin(
     ):
         snap_map[TARGET_SYMBOL]["ext_sell_restrict_until_mono"] = 0.0
 
+    st_post_0400 = context.ledger.get_state(TARGET_SYMBOL)
+    has_rem_0400_ord = bool(
+        str(st_post_0400.get("buy_order_id") or "").strip()
+        or str(st_post_0400.get("sell_order_id") or "").strip()
+    )
+    clear_0400_ord_kw: Dict[str, Any] = (
+        {}
+        if has_rem_0400_ord
+        else {
+            "buy_order_id": "",
+            "sell_order_id": "",
+            "ordered_qty": 0,
+            "target_sell_price": 0.0,
+            "pending_sell_mode": "",
+            "pending_sell_indices": [],
+            "pending_sub_sell_indices": [],
+            "pending_lot_type": "",
+            "pending_step_up_min_price": 0.0,
+            "pending_sub_step_up_min_price": 0.0,
+        }
+    )
     await context.ledger.update_state(
         TARGET_SYMBOL,
         us_commission_rate=us_comm_r,
         round_trip_fee_rate_pct=rt_fee_pct,
-        buy_order_id="",
-        sell_order_id="",
-        ordered_qty=0,
-        target_sell_price=0.0,
-        pending_sell_mode="",
-        pending_sell_indices=[],
-        pending_sub_sell_indices=[],
-        pending_lot_type="",
-        pending_step_up_min_price=0.0,
-        pending_sub_step_up_min_price=0.0,
+        **clear_0400_ord_kw,
         daily_seed_protect_pass_cnt=0,
         daily_unlock_buy_events=0,
         daily_sub_buy_cnt=0,
@@ -2067,22 +2218,33 @@ async def execute_1600_daily_closing_settlement_plugin(
         next_main_frozen = cur_main_frozen if cur_buckets else 0
         next_sub_frozen = cur_sub_frozen if cur_sub_buckets else 0
 
+    has_rem_1600_ord = bool(
+        str(st_final.get("buy_order_id") or "").strip()
+        or str(st_final.get("sell_order_id") or "").strip()
+    )
+    clear_1600_ord_kw: Dict[str, Any] = (
+        {}
+        if has_rem_1600_ord
+        else {
+            "buy_order_id": "",
+            "sell_order_id": "",
+            "ordered_qty": 0,
+            "target_sell_price": 0.0,
+            "pending_sell_mode": "",
+            "pending_sell_indices": [],
+            "pending_sub_sell_indices": [],
+            "pending_lot_type": "",
+            "pending_step_up_min_price": 0.0,
+            "pending_sub_step_up_min_price": 0.0,
+        }
+    )
     updated_st = await context.ledger.update_state(
         TARGET_SYMBOL,
         main_consec_frozen_days=next_main_frozen,
         sub_consec_frozen_days=next_sub_frozen,
         last_frozen_eval_date=today_str,
-        buy_order_id="",
-        sell_order_id="",
-        ordered_qty=0,
-        target_sell_price=0.0,
-        pending_sell_mode="",
-        pending_sell_indices=[],
-        pending_sub_sell_indices=[],
-        pending_lot_type="",
-        pending_step_up_min_price=0.0,
-        pending_sub_step_up_min_price=0.0,
         last_closing_report_date=today_str,
+        **clear_1600_ord_kw,
     )
 
     snap_fn = getattr(context.ledger, "create_daily_backup_snapshot", None)
@@ -2282,27 +2444,17 @@ async def execute_daily_1700_gc_and_backup_plugin(
     mark_sub_reentry_monitor_60s_cycle_shield(
         context=context, symbol=TARGET_SYMBOL, clear_shield=True
     )
-    await context.ledger.update_state(
-        TARGET_SYMBOL,
-        daily_seed_protect_pass_cnt=0,
-        daily_unlock_buy_events=0,
-        daily_sub_buy_cnt=0,
-        daily_sub_buy_events=0,
-        daily_sub_sell_cnt=0,
-        daily_sub_sell_events=0,
-        daily_sub_unlock_events=0,
-        daily_sub_realized_net_usd=0.0,
-        daily_main_buy_cnt=0,
-        daily_main_sell_cnt=0,
-        daily_reserve_injected_cnt=0,
-        daily_dust_guard_blocked_cnt=0,
-        pending_step_up_min_price=0.0,
-        pending_sub_step_up_min_price=0.0,
-        last_evaluated_buy_bucket_id=-1,
-        sub_last_evaluated_buy_bucket_id=-1,
-        last_reentry_eval_ts=0.0,
-        last_sub_reentry_eval_ts=0.0,
-    )
+    st_gc = context.ledger.get_state(TARGET_SYMBOL)
+    if not str(st_gc.get("buy_order_id") or "").strip():
+        await context.ledger.update_state(
+            TARGET_SYMBOL,
+            pending_step_up_min_price=0.0,
+            pending_sub_step_up_min_price=0.0,
+            last_evaluated_buy_bucket_id=-1,
+            sub_last_evaluated_buy_bucket_id=-1,
+            last_reentry_eval_ts=0.0,
+            last_sub_reentry_eval_ts=0.0,
+        )
     collected = gc.collect()
     logger.info(
         "🧹 [17:00 EST 일일 GC 및 원장 금고 백업 완료] date=%s · snapshot=%s · gc_collected=%d",

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import signal
 import sys
 import time
@@ -73,6 +74,7 @@ from quant_indicators_plugin import (
 )
 from sniper_exit_plugin import (
     execute_1m_sniper_sell_and_reanchor_plugin,
+    is_sniper_l1_trail_active,
     is_within_post_buy_time_shield,
     is_within_post_sell_time_shield,
     sync_pending_sell_order_plugin,
@@ -113,6 +115,13 @@ logger = logging.getLogger("toss_sniper.main")
 NORMAL_LOOP_INTERVAL_SEC: float = 1.50
 FAST_SHIELD_LOOP_INTERVAL_SEC: float = 0.40
 EXTENDED_ZERO_HOLD_INTERVAL_SEC: float = 5.00
+
+
+# NEW: 다중 프로세스 동시 기상을 위한 Wall-Clock 정각 격자 슬립
+def _wall_wait(iv: float, off: float = 0.0) -> float:
+    w = time.time()
+    nxt = math.ceil(((w - off) + 0.04) / iv) * iv + off
+    return max(0.05, min(iv + 0.25, nxt - w))
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +263,7 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
             candles_1d = await context.api.get_candles_1d(
                 symbol=TARGET_SYMBOL, count=10
             )
+            now_est = datetime.now(EST_TZ)  # NEW: HTTP 수신 직후 최신 시각 동기화
             live_p = safe_float(
                 context.latest_prices.get(TARGET_SYMBOL),
                 safe_float(
@@ -270,9 +280,19 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
                 now_est=now_est,
                 candles_1d=candles_1d,
             )
+            newest_lp = safe_float(
+                context.latest_prices.get(TARGET_SYMBOL), live_p
+            )
+            if newest_lp > 0.0:
+                metrics = refresh_metrics_with_live_tick(
+                    metrics,
+                    newest_lp,
+                    now_est=datetime.now(EST_TZ),
+                    symbol=TARGET_SYMBOL,
+                )
             context.candle_metrics_cache[TARGET_SYMBOL] = metrics
             if (
-                live_p <= 0.0
+                newest_lp <= 0.0
                 and safe_float(metrics.get("live_price"), 0.0) > 0.0
             ):
                 fetched_lp = safe_float(metrics.get("live_price"), 0.0)
@@ -285,6 +305,7 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
                     candles_qqq_1m = await context.api.get_candles_1m(
                         symbol=MACRO_REF_SYMBOL, total_count=60
                     )
+                    now_est = datetime.now(EST_TZ)  # NEW: QQQ 캔들 수신 직후 최신 시각 동기화
                     qqq_live_p = safe_float(
                         context.latest_prices.get(MACRO_REF_SYMBOL), 0.0
                     )
@@ -294,6 +315,16 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
                         live_price_qqq=qqq_live_p,
                         now_est=now_est,
                     )
+                    newest_qqq_p = safe_float(
+                        context.latest_prices.get(MACRO_REF_SYMBOL), qqq_live_p
+                    )
+                    if newest_qqq_p > 0.0:
+                        qqq_metrics = refresh_metrics_with_live_tick(
+                            qqq_metrics,
+                            newest_qqq_p,
+                            now_est=datetime.now(EST_TZ),
+                            symbol=MACRO_REF_SYMBOL,
+                        )
                     context.candle_metrics_cache[MACRO_REF_SYMBOL] = qqq_metrics
                 except Exception as qqq_exc:
                     logger.debug("QQQ 캔들 레이더 폴백(묵음): %s", qqq_exc)
@@ -304,7 +335,7 @@ async def candle_radar_loop(context: SniperAppContext) -> None:
 
         try:
             await asyncio.wait_for(
-                context.shutdown_event.wait(), timeout=sleep_sec
+                context.shutdown_event.wait(), timeout=(_wall_wait(5.0, 0.15) if in_market else sleep_sec)
             )
         except asyncio.TimeoutError:
             pass
@@ -318,6 +349,8 @@ def _evaluate_fast_shield_mode(
     🗡️ 암살자 +1.00% 트레일링 점화(assassin_high_freq_active) 시 루프를 0.40초로 가속한다.
     """
     if bool(getattr(context, "assassin_high_freq_active", False)):
+        return True
+    if is_sniper_l1_trail_active(context, TARGET_SYMBOL):
         return True
     if str(st.get("buy_order_id") or "").strip() or str(
         st.get("sell_order_id") or ""
@@ -384,6 +417,18 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
             if 400 <= hm <= 406 and context.last_0400_sync_date != today_str:
                 if is_live_assassin_standalone_active(context):
                     try:
+                        if hasattr(
+                            context.ledger, "rollover_daily_counters_if_needed"
+                        ):
+                            await context.ledger.rollover_daily_counters_if_needed(
+                                today_str
+                            )
+                        await context.barbell_ledger.rollover_daily_if_needed(
+                            today_str
+                        )
+                        await context.assassin_ledger.rollover_daily_session_if_needed(
+                            today_str
+                        )
                         us_c, rt_p = await context.api.ensure_us_commission_rate(
                             force_refresh=True
                         )
@@ -491,7 +536,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                 )
                 try:
                     await asyncio.wait_for(
-                        context.wakeup_event.wait(), timeout=loop_sleep_live
+                        context.wakeup_event.wait(), timeout=_wall_wait(loop_sleep_live)
                     )
                     context.wakeup_event.clear()
                 except asyncio.TimeoutError:
@@ -618,7 +663,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
                 )
                 try:
                     await asyncio.wait_for(
-                        context.wakeup_event.wait(), timeout=wait_off
+                        context.wakeup_event.wait(), timeout=_wall_wait(wait_off)
                     )
                     context.wakeup_event.clear()
                 except asyncio.TimeoutError:
@@ -720,7 +765,7 @@ async def main_sniper_loop(context: SniperAppContext) -> None:
 
         try:
             await asyncio.wait_for(
-                context.wakeup_event.wait(), timeout=loop_sleep
+                context.wakeup_event.wait(), timeout=_wall_wait(loop_sleep)
             )
             context.wakeup_event.clear()
         except asyncio.TimeoutError:
@@ -790,7 +835,7 @@ async def async_main() -> int:
     run_barbell_plugin_tdd()
     run_assassin_plugin_tdd()
     logger.info(
-        "✅ [QuantEngine TDD · Barbell 60/30/10 TDD · Assassin 14 Truth Gates TDD] 전수 검증 통과!"
+        "✅ [QuantEngine TDD · Barbell 60/30/10 TDD · Assassin 10 Truth Gates TDD] 전수 검증 통과!"
     )
 
     context = SniperAppContext(base_dir=base_dir)
@@ -917,6 +962,18 @@ async def async_main() -> int:
             await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True), timeout=2.0
             )
+        except Exception:
+            pass
+
+        try:
+            if hasattr(context.tg, "close"):
+                await asyncio.wait_for(context.tg.close(), timeout=1.5)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(context.tg, "close"):
+                await asyncio.wait_for(context.tg.close(), timeout=1.5)
         except Exception:
             pass
 

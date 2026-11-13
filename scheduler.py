@@ -278,6 +278,39 @@ async def health_loop():
         await asyncio.sleep(60)
 
 
+async def startup_radar_once():
+    """기동 직후 1회: 엔진의 🔫 스나이퍼 레이더 화면(/avwap)을 텔레그램으로 보냅니다.
+    시세·1분봉 지표가 채워진 뒤에 보내야 내용이 비지 않으므로 최대 3분까지 기다립니다."""
+    if not config.get("ALERT.STARTUP_RADAR", True) or not notify.enabled():
+        return
+    ctx = None
+    for _ in range(180):
+        await asyncio.sleep(1.0)
+        ctx = engine_hooks.runtime.context
+        if ctx is None or getattr(ctx, "tg", None) is None:
+            continue
+        try:
+            ready = bool((ctx.candle_metrics_cache or {}).get("SOXL")) and float(ctx.latest_prices.get("SOXL") or 0) > 0
+        except Exception:
+            ready = False
+        if ready:
+            break
+    if ctx is None:
+        return
+    await asyncio.sleep(2.0)                     # 생존 배너(✅ 서버가 정상 작동 중입니다) 다음 순서로 오도록
+    chat_id = str(config.TELEGRAM_CHAT_ID)
+    try:
+        tg_mod = engine_hooks.runtime.modules.get("tg_ui_plugin")
+        ctrl = tg_mod.TelegramCommandController(ctx) if tg_mod else None
+        if ctrl is not None and hasattr(ctrl, "_render_and_send_avwap"):
+            await ctrl._render_and_send_avwap(chat_id=chat_id)
+        else:                                    # 원본 구조가 바뀐 경우: 명령을 그대로 흘려 보냄
+            await ctx.tg._handle_command_or_text(chat_id=chat_id, raw_text="/avwap")
+        log.info("기동 레이더 화면 발송 완료")
+    except Exception as e:
+        log.warning("기동 레이더 화면 발송 실패: %s", e)
+
+
 def make_api_error_handler(loop):
     """브릿지에서 키움 오류가 나면 기록하고, 같은 오류는 쿨다운을 두고 알립니다."""
     recent = {}                                    # 일시 오류 발생 시각 (api_id → [ts...])
@@ -316,7 +349,8 @@ def start_all() -> list:
     if br is not None:
         br.on_api_error = make_api_error_handler(loop)
         br.on_fill = make_fill_handler(loop)
-    return [asyncio.create_task(c(), name=c.__name__) for c in (journal_loop, snapshot_loop, report_loop, health_loop)]
+    return [asyncio.create_task(c(), name=c.__name__)
+            for c in (journal_loop, snapshot_loop, report_loop, health_loop, startup_radar_once)]
 
 
 def dumps(o) -> str:

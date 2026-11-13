@@ -61,6 +61,7 @@ from quant_indicators_plugin import (
 from sniper_exit_plugin import (
     is_within_post_buy_time_shield,
     is_within_post_sell_time_shield,
+    reset_sniper_l1_trail_slots,
 )
 import toss_api
 from toss_api import (
@@ -139,6 +140,11 @@ def mark_auto_fill_grace_shield(
         guard_map[sym] = updated
 
     if tag != "SELL_FILL":
+        reset_sniper_l1_trail_slots(
+            context,
+            grid_kind=("SUB" if is_sub_tag else "MAIN"),
+            symbol=sym,
+        )
         snap_map = getattr(context, "exit_snapshot_cache", None)
         if isinstance(snap_map, dict):
             s_entry = (
@@ -493,7 +499,7 @@ def is_within_reserve_deposit_check_shield(
                 else 0.0
             )
             if (
-                last_sgov_m > 0.0
+                0.0 < last_sgov_m <= now_mono  # MODIFIED: VM 재부팅 mono 역전 가드
                 and rc_m > 0.0
                 and last_sgov_m > rc_m
                 and safe_float(bst.get("cash_bucket_usd"), 0.0) > 50.0
@@ -567,8 +573,22 @@ async def _fetch_fresh_current_soxl_price(
     fallback_price: float = 0.0,
 ) -> float:
     try:
-        fresh_map = await context.api.get_current_prices_batch((TARGET_SYMBOL,))
-        fresh_p = safe_float((fresh_map or {}).get(TARGET_SYMBOL), 0.0)
+        try:
+            fresh_map = (
+                await context.api.get_current_prices_batch(
+                    (TARGET_SYMBOL,),
+                    bypass_shm_cache=True,
+                )
+            )
+        except TypeError:
+            fresh_map = (
+                await context.api.get_current_prices_batch(
+                    (TARGET_SYMBOL,)
+                )
+            )
+        fresh_p = safe_float(
+            (fresh_map or {}).get(TARGET_SYMBOL), 0.0
+        )
         if fresh_p > 0.0:
             if isinstance(getattr(context, "latest_prices", None), dict):
                 context.latest_prices[TARGET_SYMBOL] = fresh_p
@@ -596,24 +616,37 @@ async def _get_live_soxl_rsi_14(
         raw_cache.get(TARGET_SYMBOL) if isinstance(raw_cache, dict) else None
     )
 
+    last_warm_m = safe_float(getattr(context, "_last_rsi_warm_mono", 0.0), 0.0)
     if (
         not isinstance(base_met, dict)
+        or not bool(base_met.get("rsi_ready", False))
         or safe_float(base_met.get("prev_bar_close"), 0.0) <= 0.0
-    ):
+    ) and (time.monotonic() - last_warm_m) >= 10.0:
+        if context is not None:
+            setattr(context, "_last_rsi_warm_mono", time.monotonic())
         api_obj = getattr(context, "api", None)
         if api_obj is not None and hasattr(api_obj, "get_candles_1m"):
             try:
                 c_1m = await api_obj.get_candles_1m(
-                    symbol=TARGET_SYMBOL, total_count=100
+                    symbol=TARGET_SYMBOL, total_count=400
                 )
-                if c_1m:
-                    base_met = compute_soxl_quant_metrics_1m(
-                        candles=c_1m,
-                        live_price=lp,
-                        now_est=dt_now,
+                c_1d = (
+                    await api_obj.get_candles_1d(
+                        symbol=TARGET_SYMBOL, count=10
+                    )
+                    if hasattr(api_obj, "get_candles_1d")
+                    else []
+                )
+                if c_1m or c_1d:
+                    base_met = await asyncio.to_thread(
+                        compute_soxl_quant_metrics_1m,
+                        c_1m or [],
+                        lp,
+                        dt_now,
+                        c_1d or [],
                     )
             except Exception as exc:
-                logger.debug("RSI(14) 온디맨드 1분봉 프리워밍 폴백: %s", exc)
+                logger.debug("RSI(14) 온디맨드 400봉 프리워밍 폴백: %s", exc)
 
     met = refresh_metrics_with_live_tick(
         base_met if isinstance(base_met, dict) else {},
@@ -641,12 +674,14 @@ async def _check_and_execute_guard30_or_reserve_injection(
     is_dip_promotion: bool,
     is_vacant_l1_reentry: bool,
     trigger_desc: str,
+    target_qty: int = 0,
 ) -> Tuple[bool, float, float, Dict[str, Any]]:
     """
-    # MODIFIED [Case 77, Case 86, Case 89, Case 91 + 바벨 모드 4단계 자동수혈 워터폴 결속]:
-    1) 토스 실계좌 주문가능 달러(`raw_bp_usd`)를 조회하고 일시 0.0 반환 시 0.25초 후 재시도한다.
-    2) 현재 운용 모드가 ⚖️ 바벨 모드(`BARBELL_60_30_10`)이면 `barbell_plugin.evaluate_and_execute_barbell_guard30_or_injection()` 으로
-       즉시 위임하여 [현금 10% ➔ 정규장 SGOV 10% 내림 매도 ➔ 별도 수익금고 ➔ 계좌 추가현금] 순서로 1회분(8%) 단위 자동수혈을 집행한다!
+    # MODIFIED [Case 77, Case 86, Case 89, Case 91 + Case 94/100 바벨 100% 정량 차액 Top-Up 워터폴 결속]:
+    1) 토스 실계좌 주문가능 달러(`raw_bp_usd`)를 조회하고 일시 0.0 반환 시(바벨 내부 대기버킷 포함) 0.25초 후 재시도한다.
+    2) 현재 운용 모드가 ⚖️ 바벨 모드(`BARBELL_60_30_10`)이면 `target_qty` 를 포함해
+       `barbell_plugin.evaluate_and_execute_barbell_guard30_or_injection()` 으로 즉시 위임하여
+       100% 1회분 정량 완충(부족 차액 Top-Up) 자동수혈을 집행한다!
     3) 복리/단리 모드일 때는 기존에 격리된 수익금(`vaulted_profit_locked_usd`)을 제외한 `eff_raw_bp` 로
        무제한 온디맨드 수혈(`evaluate_guard30_and_reserve_injection`)을 수행한다.
     """
@@ -662,16 +697,35 @@ async def _check_and_execute_guard30_or_reserve_injection(
         (l1_actual_cost_usd * MIN_DIP_VS_L1_RATIO if is_dip_promotion else 0.0),
     )
 
+    ledger_liquid_est = now_free_cash
+    if is_barbell_mode(st_now.get("portion_mode")) and hasattr(
+        context, "barbell_ledger"
+    ):
+        try:
+            bst_chk = context.barbell_ledger.get_state()
+            ledger_liquid_est += (
+                max(0.0, safe_float(bst_chk.get("cash_bucket_usd"), 0.0))
+                + max(
+                    0.0,
+                    safe_float(
+                        bst_chk.get("pending_sgov_buy_budget_usd"), 0.0
+                    ),
+                )
+                + max(0.0, safe_float(bst_chk.get("vault_available_usd"), 0.0))
+            )
+        except Exception:
+            pass
+
     raw_bp_usd = await context.api.get_buying_power_usd(safety_buffer_pct=0.0)
-    if raw_bp_usd <= 0.0 and now_free_cash >= est_min_req:
+    if raw_bp_usd <= 0.0 and ledger_liquid_est >= est_min_req:
         await asyncio.sleep(0.25)
         raw_bp_usd = await context.api.get_buying_power_usd(
             safety_buffer_pct=0.0
         )
         if raw_bp_usd <= 0.0:
             logger.debug(
-                "🛡️ [Case 77 예수금 API 일시 조회 지연 방어] 원장 가용현금($%.2f >= 최소 $%.2f) 정상이나 예수금 API가 0.0을 반환하여 보류",
-                now_free_cash,
+                "🛡️ [Case 77/100 예수금 API 일시 조회 지연 방어] 원장 유동성($%.2f >= 최소 $%.2f) 정상이나 예수금 API가 0.0을 반환하여 보류",
+                ledger_liquid_est,
                 est_min_req,
             )
             return (
@@ -686,7 +740,7 @@ async def _check_and_execute_guard30_or_reserve_injection(
                 },
             )
 
-    # [바벨 모드 전용 4단계 자동수혈 워터폴 위임]
+    # [바벨 모드 전용 100% 정량 차액 Top-Up 4단계 워터폴 위임]
     if is_barbell_mode(st_now.get("portion_mode")):
         (
             can_proc_b,
@@ -702,6 +756,7 @@ async def _check_and_execute_guard30_or_reserve_injection(
             l1_actual_cost_usd=l1_actual_cost_usd,
             is_dip_promotion=is_dip_promotion,
             trigger_desc=trigger_desc,
+            target_qty=target_qty,
         )
         if can_proc_b:
             mark_reserve_deposit_check_shield(
@@ -1534,9 +1589,7 @@ async def sync_pending_buy_order_plugin(
     is_vacant_l1_now = bool(len(buckets_now) > 0 and not has_active_l1_now)
     cur_target_q = max(0, safe_int(st.get("l1_target_quota_qty"), 0))
     fallback_target_q_on_zero_cancel = (
-        max(buckets_now[0].qty, cur_target_q)
-        if ((lot_type == "TOPUP_1FL" or is_sub_lot) and has_active_l1_now)
-        else (buckets_now[0].qty if has_active_l1_now else 0)
+        max(buckets_now[0].qty, cur_target_q) if has_active_l1_now else 0
     )
 
     sub_buckets_now = buckets_from_dicts(st.get("sub_buckets", []))
@@ -1547,11 +1600,8 @@ async def sync_pending_buy_order_plugin(
     cur_sub_target_q = max(0, safe_int(st.get("sub_l1_target_quota_qty"), 0))
     fallback_sub_target_q_on_zero_cancel = (
         max(sub_buckets_now[0].qty, cur_sub_target_q)
-        if (
-            (lot_type == "SUB_TOPUP_1FL" or not is_sub_lot)
-            and has_sub_active_l1_now
-        )
-        else (sub_buckets_now[0].qty if has_sub_active_l1_now else 0)
+        if has_sub_active_l1_now
+        else 0
     )
 
     is_zero_grid_reentry = bool(
@@ -1654,20 +1704,46 @@ async def sync_pending_buy_order_plugin(
                 except Exception:
                     pass
                 final_det = await context.api.get_order_detail(buy_oid)
-                if isinstance(final_det, dict):
-                    f_ex = (
-                        final_det.get("execution")
-                        if isinstance(final_det.get("execution"), dict)
-                        else {}
+                f_st2 = (
+                    str(final_det.get("status") or "").upper().strip()
+                    if isinstance(final_det, dict)
+                    else ""
+                )
+                if not isinstance(final_det, dict) or f_st2 in (
+                    "PENDING",
+                    "PARTIAL_FILLED",
+                    "PENDING_CANCEL",
+                    "PENDING_REPLACE",
+                ):
+                    await asyncio.sleep(0.35)
+                    final_det = await context.api.get_order_detail(buy_oid)
+                    f_st2 = (
+                        str(final_det.get("status") or "").upper().strip()
+                        if isinstance(final_det, dict)
+                        else ""
                     )
-                    f_q2 = safe_int(f_ex.get("filledQuantity"), filled_q)
-                    f_p2 = safe_float(
-                        f_ex.get("averageFilledPrice"), avg_fill_p
-                    )
-                    if f_q2 > 0:
-                        filled_q = f_q2
-                    if f_p2 > 0.0:
-                        avg_fill_p = f_p2
+                if not isinstance(final_det, dict) or f_st2 in (
+                    "PENDING",
+                    "PARTIAL_FILLED",
+                    "PENDING_CANCEL",
+                    "PENDING_REPLACE",
+                ):
+                    return {
+                        "status": "BUY_PARTIAL_CANCEL_CONFIRMING",
+                        "orderId": buy_oid,
+                        "filled_qty": filled_q,
+                    }
+                f_ex = (
+                    final_det.get("execution")
+                    if isinstance(final_det.get("execution"), dict)
+                    else {}
+                )
+                f_q2 = safe_int(f_ex.get("filledQuantity"), filled_q)
+                f_p2 = safe_float(f_ex.get("averageFilledPrice"), avg_fill_p)
+                if f_q2 > 0:
+                    filled_q = f_q2
+                if f_p2 > 0.0:
+                    avg_fill_p = f_p2
                 if filled_q > 0:
                     eff_p = avg_fill_p if avg_fill_p > 0.0 else ord_price
                     return await _commit_filled_buy_to_stratum_ledger(
@@ -1686,7 +1762,7 @@ async def sync_pending_buy_order_plugin(
                     "ordered_qty": ordered_qty,
                 }
 
-        if ord_status in ("CANCELED", "REJECTED") and filled_q == 0:
+        if ord_status in ("CANCELED", "REJECTED", "REPLACED") and filled_q == 0:
             re_epoch = (
                 mark_reentry_monitor_60s_cycle_shield(
                     context=context, symbol=TARGET_SYMBOL, eval_price=ord_price
@@ -1728,8 +1804,50 @@ async def sync_pending_buy_order_plugin(
             pass
 
         final_detail = await context.api.get_order_detail(buy_oid)
+        f_status = (
+            str(final_detail.get("status") or "").upper().strip()
+            if isinstance(final_detail, dict)
+            else ""
+        )
+        if not isinstance(final_detail, dict) or f_status in (
+            "PENDING",
+            "PARTIAL_FILLED",
+            "PENDING_CANCEL",
+            "PENDING_REPLACE",
+        ):
+            await asyncio.sleep(0.35)
+            final_detail = await context.api.get_order_detail(buy_oid)
+            f_status = (
+                str(final_detail.get("status") or "").upper().strip()
+                if isinstance(final_detail, dict)
+                else ""
+            )
+
+        if not isinstance(final_detail, dict) and elapsed_mod >= (
+            BUY_ORDER_MAX_WAIT_SEC + 15.0
+        ):
+            closed_cands = await context.api.get_closed_orders(
+                symbol=TARGET_SYMBOL, limit=25
+            )
+            for c_item in closed_cands:
+                if str(c_item.get("orderId") or "").strip() == buy_oid:
+                    final_detail = c_item
+                    f_status = (
+                        str(c_item.get("status") or "").upper().strip()
+                    )
+                    break
+
         if isinstance(final_detail, dict):
-            f_status = str(final_detail.get("status") or "").upper().strip()
+            if f_status in (
+                "PENDING",
+                "PARTIAL_FILLED",
+                "PENDING_CANCEL",
+                "PENDING_REPLACE",
+            ):
+                return {
+                    "status": "BUY_CANCEL_IN_FLIGHT",
+                    "orderId": buy_oid,
+                }
             f_exec = (
                 final_detail.get("execution")
                 if isinstance(final_detail.get("execution"), dict)
@@ -1747,6 +1865,11 @@ async def sync_pending_buy_order_plugin(
                     settled_order_id=buy_oid,
                     ordered_qty=ordered_qty,
                 )
+        elif elapsed_mod < (BUY_ORDER_MAX_WAIT_SEC + 30.0):
+            return {
+                "status": "BUY_CANCEL_VERIFY_RETRY",
+                "orderId": buy_oid,
+            }
 
         re_epoch = (
             mark_reentry_monitor_60s_cycle_shield(

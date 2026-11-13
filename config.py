@@ -124,6 +124,7 @@ DEFAULTS = {
         "DEPOSIT_CACHE_SEC": 1.5,
         "CANDLE_1M_CACHE_SEC": 4.0,
         "CANDLE_1D_CACHE_SEC": 300,
+        "SHM_BUS_DIR": "/dev/shm/kiw_soxl_bus_v3",   # v18 원본 공유 버스(시세·10G 신호) 폴더. 토스봇과 분리
         "CANDLE_MAX_PAGES": 4,
         "BUYING_POWER_SOURCE": "FC_ORD_ALOWA",
     },

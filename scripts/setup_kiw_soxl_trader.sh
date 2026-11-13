@@ -150,7 +150,7 @@ fi
 # ── 8. deploy / stop / sync 스크립트 등록 ──────────────────────
 echo ""
 echo "📜 배포/중지/원본동기화 스크립트 등록 중..."
-for s in deploy_kiw_soxl.sh stop_kiw_soxl.sh sync_kiw_soxl.sh; do
+for s in deploy_kiw_soxl.sh stop_kiw_soxl.sh sync_kiw_soxl.sh email_setup_kiw_soxl.sh; do
     [ -f "$TARGET/scripts/$s" ] && cp "$TARGET/scripts/$s" ~/"$s"
     if [ -f ~/"$s" ]; then
         chmod +x ~/"$s"

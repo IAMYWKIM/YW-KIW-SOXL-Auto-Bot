@@ -30,6 +30,7 @@ SECTIONS = {
         ("REPORT.SNAPSHOT_INTERVAL_MIN", "자산 스냅샷 간격(분)", "choice", [5, 10, 30, 60], lambda v: f"{v}분"),
     ], "미국 정규장은 한국시간 06:00(서머타임 05:00)에 끝납니다. 그 뒤 시각으로 맞추세요."),
     "alert": ("🔔 알림", [
+        ("ALERT.STARTUP_RADAR", "기동 시 스나이퍼 레이더 화면", "bool", None, None),
         ("ALERT.FILL", "체결 한 줄 알림(봇 기록 기준)", "bool", None, None),
         ("ALERT.API_ERROR", "키움 API 오류 알림", "bool", None, None),
         ("ALERT.API_ERROR_COOLDOWN_MIN", "같은 오류 알림 간격", "choice", [10, 30, 60, 180], lambda v: f"{v}분"),

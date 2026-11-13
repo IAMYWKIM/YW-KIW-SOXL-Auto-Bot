@@ -47,6 +47,15 @@ from quant_engine_core import (
     REENTRY_PULLBACK_DROP_PCT,
     RESERVE_DEPOSIT_TOLERANCE_RATIO,
     ROUND_TRIP_FEE_RATE_PCT,
+    SNIPER_L1_TRAIL_BOOST_TIER2_PCT,
+    SNIPER_L1_TRAIL_CB_TIGHT_PCT,
+    SNIPER_L1_TRAIL_CB_WIDE_PCT,
+    SNIPER_L1_TRAIL_ENABLED,
+    SNIPER_L1_TRAIL_IGNITE_PCT,
+    SNIPER_L1_TRAIL_QQQ_BYPASS_PCT,
+    SNIPER_L1_TRAIL_SAFE_CAP_PCT,
+    SNIPER_L1_TRAIL_STEP_LOCK_PCT,
+    SNIPER_L1_TRAIL_STEP_TRIG_PCT,
     STEP_UP_2X_DROP_PCT,
     STEP_UP_2X_MAX_TIERS,
     STEP_UP_2X_MIN_CASH_RATIO,
@@ -144,14 +153,21 @@ def vrev_add_quota_lot_and_merge_2tier(
         str(merge_mode or DEFAULT_GRID_MERGE_MODE).upper().strip()
     )
 
-    if not has_active_l1_bucket(existing) and tag in (
-        "REENTRY_1FL",
-        "TOPUP_1FL",
-    ):
-        preserved_uppers = relabel_upper_grid_tiers(
-            existing, max_tiers=eff_max_tiers, merge_mode=eff_merge_mode
+    if not has_active_l1_bucket(existing):
+        if tag in ("REENTRY_1FL", "TOPUP_1FL") or (
+            pure_p <= existing[0].book_price + 1e-6
+        ):
+            preserved_uppers = relabel_upper_grid_tiers(
+                existing, max_tiers=eff_max_tiers, merge_mode=eff_merge_mode
+            )
+            return [new_l1] + preserved_uppers
+        combined_uppers = list(existing) + [new_l1]
+        combined_uppers.sort(key=lambda b: round(b.book_price, 4))
+        return relabel_upper_grid_tiers(
+            combined_uppers,
+            max_tiers=eff_max_tiers,
+            merge_mode=eff_merge_mode,
         )
-        return [new_l1] + preserved_uppers
 
     if tag == "TOPUP_1FL" and has_active_l1_bucket(existing):
         old_b1 = existing[0]
@@ -736,6 +752,7 @@ def evaluate_multi_grid_sell_targets(
     rise_upper_pct: float = 1.00,
     is_overnight_session: bool = False,
     sub_buckets: Optional[Sequence[StratumBucket]] = None,
+    exclude_daytime_l1: bool = False,
 ) -> Dict[str, Any]:
     valid = [
         b
@@ -795,7 +812,9 @@ def evaluate_multi_grid_sell_targets(
             hit_wma_grad = True
 
     if not hit_wma_grad:
-        if active_l1 and valid:
+        if active_l1 and valid and not (
+            exclude_daytime_l1 and not is_overnight_session
+        ):
             b1 = valid[0]
             min_l1_target_p = (
                 math.ceil(
@@ -849,7 +868,9 @@ def evaluate_multi_grid_sell_targets(
             hit_sub_wma_grad = True
 
     if not hit_sub_wma_grad:
-        if sub_active_l1 and valid_sub:
+        if sub_active_l1 and valid_sub and not (
+            exclude_daytime_l1 and not is_overnight_session
+        ):
             sb1 = valid_sub[0]
             min_sub_l1_target_p = (
                 math.ceil(
@@ -1396,6 +1417,8 @@ def summarize_stratum_portfolio(
     )
 
     l1_target_price = 0.0
+    l1_ignite_100_price = 0.0
+    l1_lock_125_price = 0.0
     l2_target_price = upper_wma_target_price
     l1_gain_pct = 0.0
     l2_gain_pct = 0.0
@@ -1406,6 +1429,30 @@ def summarize_stratum_portfolio(
         l1_target_price = round(
             math.ceil(
                 (b1.book_price * (1.0 + rise_l1_pct / 100.0) - 1e-9) * 100.0
+            )
+            / 100.0,
+            2,
+        )
+        l1_ignite_100_price = round(
+            math.ceil(
+                (
+                    b1.book_price
+                    * (1.0 + SNIPER_L1_TRAIL_IGNITE_PCT / 100.0)
+                    - 1e-9
+                )
+                * 100.0
+            )
+            / 100.0,
+            2,
+        )
+        l1_lock_125_price = round(
+            math.ceil(
+                (
+                    b1.book_price
+                    * (1.0 + SNIPER_L1_TRAIL_STEP_LOCK_PCT / 100.0)
+                    - 1e-9
+                )
+                * 100.0
             )
             / 100.0,
             2,
@@ -1646,6 +1693,8 @@ def summarize_stratum_portfolio(
     )
 
     sub_l1_target_price = 0.0
+    sub_l1_ignite_100_price = 0.0
+    sub_l1_lock_125_price = 0.0
     sub_l1_gain_pct = 0.0
     sub_l2_gain_pct = 0.0
     if sub_active_l1 and sub_buckets:
@@ -1653,6 +1702,30 @@ def summarize_stratum_portfolio(
         sub_l1_target_price = round(
             math.ceil(
                 (sb1.book_price * (1.0 + sub_rise_l1_pct / 100.0) - 1e-9)
+                * 100.0
+            )
+            / 100.0,
+            2,
+        )
+        sub_l1_ignite_100_price = round(
+            math.ceil(
+                (
+                    sb1.book_price
+                    * (1.0 + SNIPER_L1_TRAIL_IGNITE_PCT / 100.0)
+                    - 1e-9
+                )
+                * 100.0
+            )
+            / 100.0,
+            2,
+        )
+        sub_l1_lock_125_price = round(
+            math.ceil(
+                (
+                    sb1.book_price
+                    * (1.0 + SNIPER_L1_TRAIL_STEP_LOCK_PCT / 100.0)
+                    - 1e-9
+                )
                 * 100.0
             )
             / 100.0,
@@ -1830,7 +1903,20 @@ def summarize_stratum_portfolio(
         max_reserve_portions=MAX_RESERVE_PORTIONS,
         round_trip_fee_rate_pct=eff_rt_fee_pct,
     )
-    min_req_cash_guard30 = safe_float(guard30_eval.get("min_req_cash"), 0.0)
+    dust_floor_cash_guard30 = safe_float(guard30_eval.get("min_req_cash"), 0.0)
+    if is_barbell:
+        # MODIFIED [Case 100]: 바벨 모드는 100% 1회분 정량(수수료 버퍼 포함)을 자동수혈 발동 기준선으로 표출
+        fee_mult_sum = 1.0 + (eff_rt_fee_pct / 100.0)
+        min_req_cash_guard30 = round(
+            max(
+                next_portion_budget * fee_mult_sum,
+                float(next_target_qty) * eff_exec_for_cap * fee_mult_sum,
+                dust_floor_cash_guard30,
+            ),
+            4,
+        )
+    else:
+        min_req_cash_guard30 = dust_floor_cash_guard30
 
     market_eval_usd = (
         round(float(total_held_shares) * lp, 4)
@@ -1851,8 +1937,18 @@ def summarize_stratum_portfolio(
     realized_roi_pct = round((cum_realized / init_seed) * 100.0, 2)
     if is_barbell:
         soxl_mark_net = (free_cash + market_eval_usd) - injected_reserve_usd
+        cyc_loss_ref = min(
+            0.0, safe_float(st.get("cycle_realized_net_usd"), 0.0)
+        )
+        prior_unvaulted_adj = (
+            cum_realized - vaulted_profit_locked_usd
+        ) - cyc_loss_ref
         gross_mark_equity_usd = round(
-            free_cash + market_eval_usd + barbell_non_soxl_seed_usd + vaulted_profit_locked_usd,
+            free_cash
+            + market_eval_usd
+            + barbell_non_soxl_seed_usd
+            + vaulted_profit_locked_usd
+            + prior_unvaulted_adj,
             4,
         )
         total_mark_equity_usd = round(
@@ -1860,7 +1956,8 @@ def summarize_stratum_portfolio(
                 0.0,
                 soxl_mark_net
                 + barbell_non_soxl_seed_usd
-                + vaulted_profit_locked_usd,
+                + vaulted_profit_locked_usd
+                + prior_unvaulted_adj,
             ),
             4,
         )
@@ -1888,9 +1985,14 @@ def summarize_stratum_portfolio(
 
     proj_main_l1_net = 0.0
     if active_l1 and buckets and l1_target_price > 0.0:
+        eff_main_l1_grad_p = (
+            min(l1_target_price, upper_wma_target_price)
+            if (upper_qty > 0 and upper_wma_target_price > 0.0)
+            else l1_target_price
+        )
         proj_main_l1_net = calc_sell_realized_pnl(
             sold_qty=buckets[0].qty,
-            sell_exec_price=l1_target_price,
+            sell_exec_price=eff_main_l1_grad_p,
             sold_actual_cost_usd=buckets[0].actual_cost_usd,
             round_trip_fee_rate_pct=eff_rt_fee_pct,
         )["net_pnl_usd"]
@@ -1906,9 +2008,14 @@ def summarize_stratum_portfolio(
 
     proj_sub_l1_net = 0.0
     if sub_active_l1 and sub_buckets and sub_l1_target_price > 0.0:
+        eff_sub_l1_grad_p = (
+            min(sub_l1_target_price, sub_upper_wma_target_price)
+            if (sub_upper_qty > 0 and sub_upper_wma_target_price > 0.0)
+            else sub_l1_target_price
+        )
         proj_sub_l1_net = calc_sell_realized_pnl(
             sold_qty=sub_buckets[0].qty,
-            sell_exec_price=sub_l1_target_price,
+            sell_exec_price=eff_sub_l1_grad_p,
             sold_actual_cost_usd=sub_buckets[0].actual_cost_usd,
             round_trip_fee_rate_pct=eff_rt_fee_pct,
         )["net_pnl_usd"]
@@ -2071,6 +2178,8 @@ def summarize_stratum_portfolio(
         "sub_min_indiv_upper_price": sub_min_indiv_upper_price,
         "sub_min_indiv_upper_target_price": sub_min_indiv_upper_target_price,
         "sub_l1_target_price": sub_l1_target_price,
+        "sub_l1_ignite_100_price": sub_l1_ignite_100_price,
+        "sub_l1_lock_125_price": sub_l1_lock_125_price,
         "sub_l1_gain_pct": sub_l1_gain_pct,
         "sub_l2_gain_pct": sub_l2_gain_pct,
         "sub_drop_buy_pct": sub_drop_buy_pct,
@@ -2190,6 +2299,8 @@ def summarize_stratum_portfolio(
         "rise_sell_l1_pct": rise_l1_pct,
         "rise_sell_l2_pct": rise_l2_pct,
         "l1_target_price": l1_target_price,
+        "l1_ignite_100_price": l1_ignite_100_price,
+        "l1_lock_125_price": l1_lock_125_price,
         "l2_target_price": l2_target_price,
         "l1_gain_pct": l1_gain_pct,
         "l2_gain_pct": l2_gain_pct,

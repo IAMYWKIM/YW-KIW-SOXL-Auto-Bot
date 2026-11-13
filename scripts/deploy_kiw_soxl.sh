@@ -66,7 +66,7 @@ if [ -n "$ZIP" ]; then
     cp -r "$TMP"/. "$TARGET"/
     rm -rf "$TMP"
     mkdir -p ~/kiw_soxl_installed && mv "$ZIP" ~/kiw_soxl_installed/
-    for s in deploy_kiw_soxl.sh stop_kiw_soxl.sh sync_kiw_soxl.sh; do
+    for s in deploy_kiw_soxl.sh stop_kiw_soxl.sh sync_kiw_soxl.sh email_setup_kiw_soxl.sh; do
         [ -f "$TARGET/scripts/$s" ] && [ "$s" != "deploy_kiw_soxl.sh" ] && cp "$TARGET/scripts/$s" ~/"$s" && chmod +x ~/"$s"
     done
     [ -f "$TARGET/scripts/deploy_kiw_soxl.sh" ] && cp "$TARGET/scripts/deploy_kiw_soxl.sh" ~/deploy_kiw_soxl.sh.new \

@@ -173,7 +173,8 @@ def _record_live_tick_to_memory_bar(
 
     with _LIVE_1M_BAR_LOCK:
         bars = _LIVE_1M_BAR_STORE.setdefault(sym, [])
-        if bars and str(bars[-1].get("_min_key") or "") == min_key:
+        last_mk = str(bars[-1].get("_min_key") or "") if bars else ""
+        if bars and last_mk == min_key:
             last_b = bars[-1]
             prev_h = safe_float(last_b.get("highPrice"), lp)
             prev_l = safe_float(last_b.get("lowPrice"), lp)
@@ -182,6 +183,18 @@ def _record_live_tick_to_memory_bar(
                 min(prev_l, lp) if prev_l > 0.0 else lp, 4
             )
             last_b["closePrice"] = lp
+        elif bars and min_key < last_mk:
+            # MODIFIED: 정각 분봉 전환 직후 지연 틱의 역순 중복 추가 원천 차단
+            for prev_b in reversed(bars[-5:]):
+                if str(prev_b.get("_min_key") or "") == min_key:
+                    p_h = safe_float(prev_b.get("highPrice"), lp)
+                    p_l = safe_float(prev_b.get("lowPrice"), lp)
+                    prev_b["highPrice"] = round(max(p_h, lp), 4)
+                    prev_b["lowPrice"] = round(
+                        min(p_l, lp) if p_l > 0.0 else lp, 4
+                    )
+                    break
+            return last_mk, len(bars)
         else:
             bars.append(
                 {
@@ -192,7 +205,7 @@ def _record_live_tick_to_memory_bar(
                     "highPrice": lp,
                     "lowPrice": lp,
                     "closePrice": lp,
-                    "volume": 1.0,
+                    "volume": 0.0,
                     "currency": "USD",
                 }
             )
@@ -243,7 +256,7 @@ def _sync_api_candles_into_memory_store(
                     "highPrice": round(float(h_v), 4),
                     "lowPrice": round(float(l_v), 4),
                     "closePrice": round(float(c_v), 4),
-                    "volume": round(max(1.0, float(v_v)), 2),
+                    "volume": round(max(0.0, float(v_v)), 2),
                     "currency": "USD",
                 }
             )
@@ -573,11 +586,9 @@ def compute_realtime_synthetic_rsi(
     cur_l = max(0.0, -diff)
 
     if prev_g <= 1e-12 and prev_l <= 1e-12:
-        live_g = cur_g / p_len
-        live_l = cur_l / p_len
-    else:
-        live_g = (prev_g * (p_len - 1.0) + cur_g) / p_len
-        live_l = (prev_l * (p_len - 1.0) + cur_l) / p_len
+        return 50.0
+    live_g = (prev_g * (p_len - 1.0) + cur_g) / p_len
+    live_l = (prev_l * (p_len - 1.0) + cur_l) / p_len
 
     if live_g <= 1e-12 and live_l <= 1e-12:
         return 50.0
@@ -597,7 +608,13 @@ def _compute_5ma_intraday_amp_pct_vectorized(
     """
     if isinstance(daily_candles, list) and len(daily_candles) >= 2:
         try:
-            df_d = pd.DataFrame(daily_candles)
+            sorted_dc = sorted(
+                [c for c in daily_candles if isinstance(c, dict)],
+                key=lambda x: str(
+                    x.get("timestamp") or x.get("date") or x.get("dt") or ""
+                )[:10],
+            )
+            df_d = pd.DataFrame(sorted_dc)
             if "highPrice" in df_d.columns and "lowPrice" in df_d.columns:
                 h_s = pd.to_numeric(df_d["highPrice"], errors="coerce")
                 l_s = pd.to_numeric(df_d["lowPrice"], errors="coerce")
@@ -666,12 +683,11 @@ def _compute_vectorized_heikin_ashi_and_rsi(
     highs: np.ndarray,
     lows: np.ndarray,
     closes: np.ndarray,
+    min_keys: Optional[List[str]] = None,
+    cur_min_key: str = "",
 ) -> Dict[str, Any]:
     """
-    # MODIFIED [Case 93 : Wilder's RSI(14), Heikin-Ashi(HA_Open, HA_Close), 및 단기 변화율(1분/3분/5분/10분) 벡터화 연산기]:
-    100% 벡터화(np.diff + Wilder's EWM) 연산으로 n >= 2 이상이면 첫 봉 NaN 왜곡 없이
-    직전 완성봉 종가(prev_bar_close), 3분 전(close_3m_ago), 5분 전(close_5m_ago · DL10 전용), 10분 전(close_10m_ago) 종가와
-    직전 완성봉까지의 평균 상승/하락폭(prev_avg_gain, prev_avg_loss)을 산출한다.
+    # MODIFIED [Case 93 & Case 99 : Wilder's RSI(14) · 실시간 HA 및 직전 완결 1분봉 확정 HA(closed_ha_*) 분리 연산기]:
     """
     n = len(closes)
     if n == 0:
@@ -695,6 +711,11 @@ def _compute_vectorized_heikin_ashi_and_rsi(
             "ha_close": 0.0,
             "prev_ha_open": 0.0,
             "prev_ha_close": 0.0,
+            "closed_bar_minute_key": "",
+            "closed_ha_open": 0.0,
+            "closed_ha_close": 0.0,
+            "closed_ha_bull": True,
+            "closed_ha_ready": False,
             "cur_bar_open": 0.0,
             "cur_bar_high": 0.0,
             "cur_bar_low": 0.0,
@@ -747,7 +768,7 @@ def _compute_vectorized_heikin_ashi_and_rsi(
     prev_avg_g = 0.0
     prev_avg_l = 0.0
 
-    if n >= 2:
+    if n >= 15:
         deltas = np.diff(closes)
         gains = np.maximum(0.0, deltas)
         losses = np.maximum(0.0, -deltas)
@@ -784,7 +805,7 @@ def _compute_vectorized_heikin_ashi_and_rsi(
     return {
         "rsi_14": clean_rsi,
         "rsi": clean_rsi,
-        "rsi_ready": bool(n >= 14),
+        "rsi_ready": bool(n >= 15),
         "candle_count": int(n),
         "prev_bar_close": round(prev_bar_close, 4),
         "close_3m_ago": round(c_3m_ago, 4),
@@ -801,6 +822,45 @@ def _compute_vectorized_heikin_ashi_and_rsi(
         "ha_close": round(cur_ha_close, 4),
         "prev_ha_open": round(prev_ha_open, 4),
         "prev_ha_close": round(prev_ha_close, 4),
+        **(
+            lambda _idx_c, _c_mk: {
+                "closed_bar_minute_key": _c_mk,
+                "closed_ha_open": (
+                    round(float(ha_open_series[_idx_c]), 4)
+                    if _idx_c >= 0
+                    else 0.0
+                ),
+                "closed_ha_close": (
+                    round(float(ha_close_arr[_idx_c]), 4)
+                    if _idx_c >= 0
+                    else 0.0
+                ),
+                "closed_ha_bull": (
+                    bool(ha_close_arr[_idx_c] >= ha_open_series[_idx_c])
+                    if _idx_c >= 0
+                    else True
+                ),
+                "closed_ha_ready": bool(_idx_c >= 14),
+            }
+        )(
+            *(
+                next(
+                    (
+                        (k_i, str(min_keys[k_i] or ""))
+                        for k_i in range(n - 1, -1, -1)
+                        if str(min_keys[k_i] or "")
+                        and str(min_keys[k_i] or "") < cur_min_key
+                    ),
+                    (-1, ""),
+                )
+                if (
+                    isinstance(min_keys, list)
+                    and len(min_keys) == n
+                    and bool(cur_min_key)
+                )
+                else ((n - 2, "") if n >= 2 else (-1, ""))
+            )
+        ),
         "cur_bar_open": round(float(opens[-1]), 4),
         "cur_bar_high": round(float(highs[-1]), 4),
         "cur_bar_low": round(float(lows[-1]), 4),
@@ -812,10 +872,11 @@ def _compute_vectorized_heikin_ashi_and_rsi(
 
 def _recompute_ha_rsi_from_memory_store(
     symbol: str = TARGET_SYMBOL,
+    cur_min_key: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     인메모리 1분봉 저장소(_LIVE_1M_BAR_STORE)에 축적된 분봉이 2개 이상일 때,
-    O(1) 수준의 경량 배열 연산(copy=True 적용)으로 Wilder's RSI(14) 및 Heikin-Ashi 기저값을 즉시 재산출한다.
+    O(1) 경량 연산으로 Wilder's RSI(14) · 실시간 HA · 직전 완결 1분봉 확정 HA(closed_ha_*)를 즉시 재산출한다.
     """
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     with _LIVE_1M_BAR_LOCK:
@@ -861,11 +922,21 @@ def _recompute_ha_rsi_from_memory_store(
         )
         if int(np.sum(valid_mask)) < 2:
             return None
+        eff_cur_mk = str(
+            cur_min_key or bars[-1].get("_min_key") or ""
+        ).strip()
+        valid_min_keys = [
+            str(bars[i].get("_min_key") or "")
+            for i, ok in enumerate(valid_mask.tolist())
+            if ok
+        ]
         res = _compute_vectorized_heikin_ashi_and_rsi(
             opens[valid_mask],
             highs[valid_mask],
             lows[valid_mask],
             closes[valid_mask],
+            min_keys=valid_min_keys,
+            cur_min_key=eff_cur_mk,
         )
         res["cur_bar_minute_key"] = str(bars[-1].get("_min_key") or "")
         return res
@@ -1074,20 +1145,28 @@ def _extract_prev_reg_close_and_pre_open(
         )
 
         df_today_api = df_api_all[df_api_all["Date"] == target_date]
-        if not df_today_api.empty:
-            pre_0407 = df_today_api[
-                (df_today_api["hm"] >= 407) & (df_today_api["hm"] <= 929)
-            ]
-            if not pre_0407.empty:
-                pre_open_p = float(pre_0407["O"].iloc[0])
-                found_true_pre_open = True
-            else:
-                pre_0400 = df_today_api[
-                    (df_today_api["hm"] >= 400) & (df_today_api["hm"] <= 929)
+        if not df_today_api.empty and not df_api_all.empty:
+            oldest_api_d = str(df_api_all["Date"].iloc[0])
+            oldest_api_hm = int(df_api_all["hm"].iloc[0])
+            window_reached_open = bool(
+                oldest_api_d < target_date
+                or (oldest_api_d == target_date and oldest_api_hm <= 415)
+            )
+            if window_reached_open:
+                pre_0407 = df_today_api[
+                    (df_today_api["hm"] >= 407) & (df_today_api["hm"] <= 929)
                 ]
-                if not pre_0400.empty:
-                    pre_open_p = float(pre_0400["O"].iloc[0])
+                if not pre_0407.empty:
+                    pre_open_p = float(pre_0407["O"].iloc[0])
                     found_true_pre_open = True
+                else:
+                    pre_0400 = df_today_api[
+                        (df_today_api["hm"] >= 400)
+                        & (df_today_api["hm"] <= 929)
+                    ]
+                    if not pre_0400.empty:
+                        pre_open_p = float(pre_0400["O"].iloc[0])
+                        found_true_pre_open = True
 
         # 전일 정규장(09:30 ~ 16:00 EST) 봉이 실제로 존재할 때만 종가 채택 (23:59 EST 야간봉 폴백 영구 금지!)
         if prev_reg_c <= 0.0:
@@ -1208,6 +1287,11 @@ def compute_soxl_quant_metrics_1m(
         "ha_close": round(lp, 4),
         "prev_ha_open": round(lp, 4),
         "prev_ha_close": round(lp, 4),
+        "closed_bar_minute_key": "",
+        "closed_ha_open": 0.0,
+        "closed_ha_close": 0.0,
+        "closed_ha_bull": True,
+        "closed_ha_ready": False,
         "cur_bar_open": round(lp, 4),
         "cur_bar_high": round(lp, 4),
         "cur_bar_low": round(lp, 4),
@@ -1350,8 +1434,16 @@ def compute_soxl_quant_metrics_1m(
             highs[-1] = max(highs[-1], lp)
             lows[-1] = min(lows[-1], lp)
 
+        min_keys_list = (
+            df["dt_min"].dt.strftime("%Y-%m-%d %H:%M").tolist()
+        )
         ha_rsi_info = _compute_vectorized_heikin_ashi_and_rsi(
-            opens, highs, lows, closes
+            opens,
+            highs,
+            lows,
+            closes,
+            min_keys=min_keys_list,
+            cur_min_key=cur_min_key,
         )
         last_dt_min = df["dt_min"].iloc[-1]
         ha_rsi_info["cur_bar_minute_key"] = last_dt_min.strftime(
@@ -1401,10 +1493,32 @@ def compute_soxl_quant_metrics_1m(
                 (df_today["hm"] >= 930) & (df_today["hm"] <= 1600)
             ]
 
-        pre_stats = _calc_session_vwap_and_bands(df_pre, ma5_amp)
-        found_true_pre_vwap = bool(pre_stats["vwap"] > 0.0)
+        df_api_chk = (
+            df[~df["is_synthetic"]] if "is_synthetic" in df.columns else df
+        )
+        reached_full_pre = bool(
+            not df_api_chk.empty
+            and (
+                str(df_api_chk["Date"].iloc[0]) < target_date
+                or (
+                    str(df_api_chk["Date"].iloc[0]) == target_date
+                    and int(df_api_chk["hm"].iloc[0]) <= 415
+                )
+            )
+        )
+        latched_info = _get_daily_anchor_latch(sym, target_date)
+        latched_pre_stats = latched_info.get("pre_stats")
+        has_latched_pre_v = bool(
+            isinstance(latched_pre_stats, dict)
+            and safe_float(latched_pre_stats.get("vwap"), 0.0) > 0.0
+        )
 
-        if found_true_pre_vwap:
+        pre_stats = _calc_session_vwap_and_bands(df_pre, ma5_amp)
+        if hm_now > 929 and not reached_full_pre and has_latched_pre_v:
+            pre_stats = dict(latched_pre_stats)
+            found_true_pre_vwap = True
+        elif pre_stats["vwap"] > 0.0 and (hm_now <= 929 or reached_full_pre):
+            found_true_pre_vwap = True
             _update_daily_anchor_latch(
                 symbol=sym,
                 target_date=target_date,
@@ -1417,14 +1531,11 @@ def compute_soxl_quant_metrics_1m(
                     )
                 ),
             )
+        elif has_latched_pre_v:
+            pre_stats = dict(latched_pre_stats)
+            found_true_pre_vwap = True
         else:
-            latched_info = _get_daily_anchor_latch(sym, target_date)
-            latched_pre_stats = latched_info.get("pre_stats")
-            if isinstance(latched_pre_stats, dict) and safe_float(
-                latched_pre_stats.get("vwap"), 0.0
-            ) > 0.0:
-                pre_stats = dict(latched_pre_stats)
-                found_true_pre_vwap = True
+            found_true_pre_vwap = False
 
         reg_stats = _calc_session_vwap_and_bands(df_reg, ma5_amp)
         all_stats = _calc_session_vwap_and_bands(df_today, ma5_amp)
@@ -1632,7 +1743,9 @@ def refresh_metrics_with_live_tick(
         safe_float(met.get("prev_bar_close"), 0.0) <= 0.0
         or (prev_min_key and prev_min_key != cur_min_key)
     ):
-        mem_ha_rsi = _recompute_ha_rsi_from_memory_store(sym)
+        mem_ha_rsi = _recompute_ha_rsi_from_memory_store(
+            sym, cur_min_key=cur_min_key
+        )
         if isinstance(mem_ha_rsi, dict):
             met.update(mem_ha_rsi)
 
@@ -1702,15 +1815,18 @@ def refresh_metrics_with_live_tick(
         prev_avg_l = max(0.0, safe_float(met.get("prev_avg_loss"), 0.0))
 
         if prev_b_close > 0.0:
-            live_rsi = compute_realtime_synthetic_rsi(
-                live_price=lp,
-                prev_bar_close=prev_b_close,
-                prev_avg_gain=prev_avg_g,
-                prev_avg_loss=prev_avg_l,
-                period=14,
-            )
-            met["rsi_14"] = live_rsi
-            met["rsi"] = live_rsi
+            if bool(met.get("rsi_ready", False)) and (
+                prev_avg_g > 1e-12 or prev_avg_l > 1e-12
+            ):
+                live_rsi = compute_realtime_synthetic_rsi(
+                    live_price=lp,
+                    prev_bar_close=prev_b_close,
+                    prev_avg_gain=prev_avg_g,
+                    prev_avg_loss=prev_avg_l,
+                    period=14,
+                )
+                met["rsi_14"] = live_rsi
+                met["rsi"] = live_rsi
             met["vel_1m_pct"] = round(
                 ((lp - prev_b_close) / prev_b_close) * 100.0, 4
             )
@@ -1732,17 +1848,11 @@ def refresh_metrics_with_live_tick(
             4,
         )
 
-        # 🚨 [Case 93 무오염 패치 : 프리장(04:07 ~ 09:29 EST) 외 구간에서는 미확보된 pre_open_price(0.0)를 현재가로 덮어쓰지 않음!]
+        # 🚨 [Case 93 무오염 패치 : 중도 재기동 시 현재가를 진성 래치로 박제하지 않으며 04:07 정각에만 임시 반영]
         pre_open_p = safe_float(met.get("pre_open_price"), 0.0)
-        if pre_open_p <= 0.0 and (407 <= hm <= 929):
+        if pre_open_p <= 0.0 and hm == 407:
             pre_open_p = round(lp, 4)
             met["pre_open_price"] = pre_open_p
-            met["found_true_pre_open"] = True
-            _update_daily_anchor_latch(
-                symbol=sym,
-                target_date=today_str,
-                pre_open_price=pre_open_p,
-            )
 
         if pre_open_p > 0.0:
             met["bear_drop_amp_pct"] = round(
@@ -1763,7 +1873,7 @@ def refresh_metrics_with_live_tick(
         if safe_float(met.get("prev_day_close"), 0.0) <= 0.0:
             met["prev_day_close"] = met["prev_reg_close"]
 
-        if not bool(met.get("rsi_ready", False)) and mem_bar_cnt >= 14:
+        if not bool(met.get("rsi_ready", False)) and mem_bar_cnt >= 15:
             met["rsi_ready"] = True
 
     if lp > 0.0 and 400 <= hm <= 929:
@@ -1777,8 +1887,7 @@ def refresh_metrics_with_live_tick(
         met["premarket_est_high"] = round(max(ph, pl * (1.0 + amp_ratio)), 2)
         met["premarket_est_low"] = round(min(pl, ph / (1.0 + amp_ratio)), 2)
         if safe_float(met.get("premarket_vwap"), 0.0) <= 0.0:
-            met["premarket_vwap"] = round(lp, 4)
-            met["found_true_pre_vwap"] = True
+            met["premarket_vwap"] = round(lp, 4) if hm == 407 else 0.0
         met["vwap"] = met["premarket_vwap"]
     elif lp > 0.0 and 930 <= hm <= 1600:
         rh = max(safe_float(met.get("regular_high"), 0.0), lp)

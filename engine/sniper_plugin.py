@@ -108,6 +108,14 @@ from sniper_plugin_core import (
     sync_dynamic_vwap_buy_order_modify,
     sync_pending_buy_order_plugin,
 )
+from barbell_plugin import (
+    get_masked_soxl_buying_power_usd,
+    is_barbell_mode,
+)
+from barbell_plugin import (
+    get_masked_soxl_buying_power_usd,
+    is_barbell_mode,
+)
 from toss_api import (
     DEFAULT_INITIAL_SEED_USD,
     EST_TZ,
@@ -119,6 +127,42 @@ from toss_api import (
 )
 
 logger = logging.getLogger("toss_sniper.sniper_plugin")
+
+
+def _resolve_masked_bp_for_soxl_sub_or_topup(
+    context: Any,
+    st_soxl: Dict[str, Any],
+    raw_bp_usd: float,
+) -> float:
+    raw_bp = max(0.0, safe_float(raw_bp_usd, 0.0))
+    if raw_bp <= 0.0:
+        return 0.0
+    if is_barbell_mode(st_soxl.get("portion_mode")):
+        return get_masked_soxl_buying_power_usd(
+            context=context, raw_bp_usd=raw_bp, st_soxl=st_soxl
+        )
+    vault_locked = max(
+        0.0, safe_float(st_soxl.get("vaulted_profit_locked_usd"), 0.0)
+    )
+    return round(max(0.0, raw_bp - vault_locked), 4)
+
+
+def _resolve_masked_bp_for_soxl_sub_or_topup(
+    context: Any,
+    st_soxl: Dict[str, Any],
+    raw_bp_usd: float,
+) -> float:
+    raw_bp = max(0.0, safe_float(raw_bp_usd, 0.0))
+    if raw_bp <= 0.0:
+        return 0.0
+    if is_barbell_mode(st_soxl.get("portion_mode")):
+        return get_masked_soxl_buying_power_usd(
+            context=context, raw_bp_usd=raw_bp, st_soxl=st_soxl
+        )
+    vault_locked = max(
+        0.0, safe_float(st_soxl.get("vaulted_profit_locked_usd"), 0.0)
+    )
+    return round(max(0.0, raw_bp - vault_locked), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -359,13 +403,16 @@ async def _execute_sub_grid_buy_engine_plugin(
                     raw_bp_sub = await context.api.get_buying_power_usd(
                         safety_buffer_pct=0.2
                     )
+                    if raw_bp_sub <= 0.0:
+                        return {"status": "HOLD_SUB_TRANSIENT_BP_API_ERROR"}
 
+                masked_bp_sub = _resolve_masked_bp_for_soxl_sub_or_topup(
+                    context, st_now, raw_bp_sub
+                )
                 idle_m = compute_sub_grid_available_idle_cash(
                     free_cash_usd=now_free_cash,
                     core_equity_usd=now_core_eq,
-                    broker_buying_power_usd=(
-                        raw_bp_sub if raw_bp_sub > 0.0 else 0.0
-                    ),
+                    broker_buying_power_usd=masked_bp_sub,
                     reserve_main_portions=SUB_RESERVE_MAIN_PORTIONS,
                     initial_seed_usd=now_init_seed,
                     portion_mode=now_p_mode,
@@ -694,13 +741,16 @@ async def _execute_sub_grid_buy_engine_plugin(
                     raw_bp_re = await context.api.get_buying_power_usd(
                         safety_buffer_pct=0.2
                     )
+                    if raw_bp_re <= 0.0:
+                        return {"status": "HOLD_SUB_TRANSIENT_BP_API_ERROR"}
 
+                masked_bp_re = _resolve_masked_bp_for_soxl_sub_or_topup(
+                    context, st_now, raw_bp_re
+                )
                 idle_re = compute_sub_grid_available_idle_cash(
                     free_cash_usd=now_free_cash,
                     core_equity_usd=now_core_eq,
-                    broker_buying_power_usd=(
-                        raw_bp_re if raw_bp_re > 0.0 else 0.0
-                    ),
+                    broker_buying_power_usd=masked_bp_re,
                     reserve_main_portions=SUB_RESERVE_MAIN_PORTIONS,
                     initial_seed_usd=now_init_seed,
                     portion_mode=now_p_mode,
@@ -951,12 +1001,19 @@ async def _execute_sub_grid_buy_engine_plugin(
                                         safety_buffer_pct=0.2
                                     )
                                 )
+                                if raw_bp_top <= 0.0:
+                                    return {
+                                        "status": "HOLD_SUB_TRANSIENT_BP_API_ERROR"
+                                    }
+                            masked_bp_top = (
+                                _resolve_masked_bp_for_soxl_sub_or_topup(
+                                    context, st_now, raw_bp_top
+                                )
+                            )
                             idle_top = compute_sub_grid_available_idle_cash(
                                 free_cash_usd=now_free_cash,
                                 core_equity_usd=now_core_eq,
-                                broker_buying_power_usd=(
-                                    raw_bp_top if raw_bp_top > 0.0 else 0.0
-                                ),
+                                broker_buying_power_usd=masked_bp_top,
                                 reserve_main_portions=SUB_RESERVE_MAIN_PORTIONS,
                                 initial_seed_usd=now_init_seed,
                                 portion_mode=now_p_mode,
@@ -1250,13 +1307,16 @@ async def _execute_sub_grid_buy_engine_plugin(
                 raw_bp_dip = await context.api.get_buying_power_usd(
                     safety_buffer_pct=0.2
                 )
+                if raw_bp_dip <= 0.0:
+                    return {"status": "HOLD_SUB_TRANSIENT_BP_API_ERROR"}
 
+            masked_bp_dip = _resolve_masked_bp_for_soxl_sub_or_topup(
+                context, st_now, raw_bp_dip
+            )
             idle_dip = compute_sub_grid_available_idle_cash(
                 free_cash_usd=now_free_cash,
                 core_equity_usd=now_core_eq,
-                broker_buying_power_usd=(
-                    raw_bp_dip if raw_bp_dip > 0.0 else 0.0
-                ),
+                broker_buying_power_usd=masked_bp_dip,
                 reserve_main_portions=SUB_RESERVE_MAIN_PORTIONS,
                 initial_seed_usd=now_init_seed,
                 portion_mode=now_p_mode,
@@ -1336,7 +1396,6 @@ async def _execute_sub_grid_buy_engine_plugin(
             oid = str(ord_res.get("orderId") or "").strip()
             await context.ledger.update_state(
                 TARGET_SYMBOL,
-                sub_l1_target_quota_qty=buy_qty_sub,
                 buy_order_id=oid,
                 client_order_id=cid,
                 ordered_qty=buy_qty_sub,
@@ -1664,6 +1723,7 @@ async def execute_seed_protected_buy_gate_plugin(
                     is_dip_promotion=False,
                     is_vacant_l1_reentry=False,
                     trigger_desc="0주 첫 1층 진입",
+                    target_qty=target_qty,
                 )
                 if not can_proceed_0sh:
                     return {
@@ -2087,6 +2147,7 @@ async def execute_seed_protected_buy_gate_plugin(
                     is_dip_promotion=False,
                     is_vacant_l1_reentry=True,
                     trigger_desc=f"1층 공석 재장전({sig_type})",
+                    target_qty=target_qty,
                 )
                 if not can_proceed_re:
                     return {
@@ -2290,8 +2351,17 @@ async def execute_seed_protected_buy_gate_plugin(
                             raw_bp_top = await context.api.get_buying_power_usd(
                                 safety_buffer_pct=0.2
                             )
+                            if raw_bp_top <= 0.0:
+                                return {
+                                    "status": "HOLD_TOPUP_TRANSIENT_BP_ERROR"
+                                }
 
-                        if raw_bp_top < one_share_top_cost:
+                        masked_bp_main_top = (
+                            _resolve_masked_bp_for_soxl_sub_or_topup(
+                                context, st_now, raw_bp_top
+                            )
+                        )
+                        if masked_bp_main_top < one_share_top_cost:
                             mark_reserve_deposit_check_shield(
                                 context=context,
                                 symbol=TARGET_SYMBOL,
@@ -2299,7 +2369,7 @@ async def execute_seed_protected_buy_gate_plugin(
                             )
                             return {
                                 "status": "HOLD_TOPUP_INSUFFICIENT_BROKER_BP",
-                                "broker_bp_usd": raw_bp_top,
+                                "broker_bp_usd": masked_bp_main_top,
                                 "free_cash_usd": now_free_cash,
                             }
 
@@ -2307,7 +2377,7 @@ async def execute_seed_protected_buy_gate_plugin(
                             target_qty=now_rem_qty,
                             price_t=exec_order_p,
                             free_cash_usd=now_free_cash,
-                            broker_buying_power_usd=raw_bp_top,
+                            broker_buying_power_usd=masked_bp_main_top,
                             max_portion_budget_usd=topup_budget,
                             round_trip_fee_rate_pct=eff_rt_pct_top,
                         )
@@ -2681,6 +2751,7 @@ async def execute_seed_protected_buy_gate_plugin(
                 is_dip_promotion=True,
                 is_vacant_l1_reentry=False,
                 trigger_desc=f"{now_held_lots + 1}회차 추매({trigger_tag})",
+                target_qty=target_qty,
             )
             if not can_proceed_dip:
                 return {
@@ -2731,7 +2802,6 @@ async def execute_seed_protected_buy_gate_plugin(
             oid = str(ord_res.get("orderId") or "").strip()
             await context.ledger.update_state(
                 TARGET_SYMBOL,
-                l1_target_quota_qty=buy_qty,
                 buy_order_id=oid,
                 client_order_id=cid,
                 ordered_qty=buy_qty,

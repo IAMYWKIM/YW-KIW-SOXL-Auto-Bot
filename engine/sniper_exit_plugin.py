@@ -14,6 +14,7 @@ import asyncio
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -32,6 +33,15 @@ from quant_engine import (
     PORTION_MODE_COMPOUND,
     PORTION_MODE_SIMPLE,
     REANCHOR_NET_BUFFER_MULT,
+    SNIPER_L1_TRAIL_BOOST_TIER2_PCT,
+    SNIPER_L1_TRAIL_CB_TIGHT_PCT,
+    SNIPER_L1_TRAIL_CB_WIDE_PCT,
+    SNIPER_L1_TRAIL_ENABLED,
+    SNIPER_L1_TRAIL_IGNITE_PCT,
+    SNIPER_L1_TRAIL_QQQ_BYPASS_PCT,
+    SNIPER_L1_TRAIL_SAFE_CAP_PCT,
+    SNIPER_L1_TRAIL_STEP_LOCK_PCT,
+    SNIPER_L1_TRAIL_STEP_TRIG_PCT,
     SUB_MAX_TIERS_3,
     SUB_MAX_TOTAL_LOTS_4,
     SUB_MERGE_MODE_L1_L3,
@@ -99,6 +109,194 @@ MARKETABLE_GAP_UP_SLIPPAGE_MULT: float = 0.997
 
 _LAST_CONSUMED_WICK_TRADE_TS: float = 0.0
 _LAST_WICK_PROBE_MONO: float = 0.0
+_LAST_EXIT_CANDLE_WARM_MONO: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# [NEW · Case 99] 스나이퍼 본 1층 / 서브 1층 인메모리 스텝 락온 & "허락보다 용서를" 상태 슬롯
+# ---------------------------------------------------------------------------
+@dataclass
+class SniperL1TrailSlot:
+    grid_kind: str = "MAIN"
+    qty: int = 0
+    ref_cost: float = 0.0
+    arm_100_p: float = 0.0
+    step_trig_145_p: float = 0.0
+    lock_125_p: float = 0.0
+    cap_500_p: float = 0.0
+    armed: bool = False
+    stepped_125: bool = False
+    armed_minute_key: str = ""
+    forgiven_ha_minute_key: str = ""
+    forgive_count: int = 0
+    peak_p: float = 0.0
+    lock_floor_p: float = 0.0
+    active_stop_p: float = 0.0
+
+    def full_reset(self) -> None:
+        self.qty = 0
+        self.ref_cost = 0.0
+        self.arm_100_p = 0.0
+        self.step_trig_145_p = 0.0
+        self.lock_125_p = 0.0
+        self.cap_500_p = 0.0
+        self.armed = False
+        self.stepped_125 = False
+        self.armed_minute_key = ""
+        self.forgiven_ha_minute_key = ""
+        self.forgive_count = 0
+        self.peak_p = 0.0
+        self.lock_floor_p = 0.0
+        self.active_stop_p = 0.0
+
+    def sync_fingerprint(self, qty: int, book_price: float) -> None:
+        q_clean = max(0, safe_int(qty, 0))
+        bp_clean = round(max(0.0, safe_float(book_price, 0.0)), 4)
+        if q_clean <= 0 or bp_clean <= 0.0:
+            self.full_reset()
+            return
+        if self.qty != q_clean or abs(self.ref_cost - bp_clean) > 1e-4:
+            self.full_reset()
+            self.qty = q_clean
+            self.ref_cost = bp_clean
+            self.arm_100_p = (
+                math.ceil(
+                    (
+                        bp_clean * (1.0 + SNIPER_L1_TRAIL_IGNITE_PCT / 100.0)
+                        - 1e-9
+                    )
+                    * 100.0
+                )
+                / 100.0
+            )
+            self.step_trig_145_p = round(
+                bp_clean * (1.0 + SNIPER_L1_TRAIL_STEP_TRIG_PCT / 100.0), 4
+            )
+            self.lock_125_p = (
+                math.ceil(
+                    (
+                        bp_clean
+                        * (1.0 + SNIPER_L1_TRAIL_STEP_LOCK_PCT / 100.0)
+                        - 1e-9
+                    )
+                    * 100.0
+                )
+                / 100.0
+            )
+            self.cap_500_p = round(
+                bp_clean * (1.0 + SNIPER_L1_TRAIL_SAFE_CAP_PCT / 100.0), 2
+            )
+
+    def refresh_stop_price(self) -> float:
+        if not self.armed or self.ref_cost <= 0.0:
+            self.active_stop_p = 0.0
+            return 0.0
+        if (not self.stepped_125) and (
+            self.peak_p >= self.step_trig_145_p - 1e-9
+        ):
+            self.stepped_125 = True
+            self.lock_floor_p = self.lock_125_p
+        pk_gain = ((self.peak_p - self.ref_cost) / self.ref_cost) * 100.0
+        cb_pct = (
+            SNIPER_L1_TRAIL_CB_WIDE_PCT
+            if pk_gain >= SNIPER_L1_TRAIL_BOOST_TIER2_PCT
+            else SNIPER_L1_TRAIL_CB_TIGHT_PCT
+        )
+        cb_raw = round(self.peak_p * (1.0 - cb_pct / 100.0), 2)
+        self.active_stop_p = round(max(self.lock_floor_p, cb_raw), 2)
+        return self.active_stop_p
+
+    def release_forgive(self, bad_ha_minute_key: str = "") -> None:
+        self.armed = False
+        self.stepped_125 = False
+        self.armed_minute_key = ""
+        self.peak_p = 0.0
+        self.lock_floor_p = 0.0
+        self.active_stop_p = 0.0
+        if bad_ha_minute_key:
+            self.forgiven_ha_minute_key = str(bad_ha_minute_key).strip()
+        self.forgive_count += 1
+
+    def release_overnight(self) -> None:
+        if self.armed:
+            self.armed = False
+            self.stepped_125 = False
+            self.armed_minute_key = ""
+            self.peak_p = 0.0
+            self.lock_floor_p = 0.0
+            self.active_stop_p = 0.0
+
+    def to_ui_dict(self) -> Dict[str, Any]:
+        return {
+            "armed": bool(self.armed),
+            "stepped_125": bool(self.stepped_125),
+            "arm_100_p": round(self.arm_100_p, 2),
+            "lock_125_p": round(self.lock_125_p, 2),
+            "peak_p": round(self.peak_p, 2),
+            "lock_floor_p": round(self.lock_floor_p, 2),
+            "active_stop_p": round(self.active_stop_p, 2),
+            "forgiven_ha_minute_key": self.forgiven_ha_minute_key,
+            "forgive_count": int(self.forgive_count),
+        }
+
+
+def get_sniper_l1_trail_slots(
+    context: Any,
+    symbol: str = TARGET_SYMBOL,
+) -> Tuple[SniperL1TrailSlot, SniperL1TrailSlot]:
+    sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    snap_map = getattr(context, "exit_snapshot_cache", None)
+    if not isinstance(snap_map, dict):
+        return SniperL1TrailSlot("MAIN"), SniperL1TrailSlot("SUB")
+    entry = snap_map.get(sym)
+    if not isinstance(entry, dict):
+        entry = {}
+        snap_map[sym] = entry
+    main_slot = entry.get("main_l1_trail")
+    if not isinstance(main_slot, SniperL1TrailSlot):
+        main_slot = SniperL1TrailSlot("MAIN")
+        entry["main_l1_trail"] = main_slot
+    sub_slot = entry.get("sub_l1_trail")
+    if not isinstance(sub_slot, SniperL1TrailSlot):
+        sub_slot = SniperL1TrailSlot("SUB")
+        entry["sub_l1_trail"] = sub_slot
+    return main_slot, sub_slot
+
+
+def reset_sniper_l1_trail_slots(
+    context: Any,
+    grid_kind: str = "ALL",
+    symbol: str = TARGET_SYMBOL,
+) -> None:
+    if context is None:
+        return
+    main_slot, sub_slot = get_sniper_l1_trail_slots(context, symbol=symbol)
+    kind_u = str(grid_kind or "ALL").upper().strip()
+    if kind_u in ("ALL", "MAIN"):
+        main_slot.full_reset()
+    if kind_u in ("ALL", "SUB"):
+        sub_slot.full_reset()
+
+
+def is_sniper_l1_trail_active(
+    context: Any,
+    symbol: str = TARGET_SYMBOL,
+) -> bool:
+    if context is None or not SNIPER_L1_TRAIL_ENABLED:
+        return False
+    main_slot, sub_slot = get_sniper_l1_trail_slots(context, symbol=symbol)
+    return bool(main_slot.armed or sub_slot.armed)
+
+
+def get_sniper_l1_trail_ui_snapshot(
+    context: Any,
+    symbol: str = TARGET_SYMBOL,
+) -> Dict[str, Dict[str, Any]]:
+    main_slot, sub_slot = get_sniper_l1_trail_slots(context, symbol=symbol)
+    return {
+        "main": main_slot.to_ui_dict(),
+        "sub": sub_slot.to_ui_dict(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +370,22 @@ async def _fetch_fresh_current_soxl_price(
     fallback_price: float = 0.0,
 ) -> float:
     try:
-        fresh_map = await context.api.get_current_prices_batch((TARGET_SYMBOL,))
-        fresh_p = safe_float((fresh_map or {}).get(TARGET_SYMBOL), 0.0)
+        try:
+            fresh_map = (
+                await context.api.get_current_prices_batch(
+                    (TARGET_SYMBOL,),
+                    bypass_shm_cache=True,
+                )
+            )
+        except TypeError:
+            fresh_map = (
+                await context.api.get_current_prices_batch(
+                    (TARGET_SYMBOL,)
+                )
+            )
+        fresh_p = safe_float(
+            (fresh_map or {}).get(TARGET_SYMBOL), 0.0
+        )
         if fresh_p > 0.0:
             if isinstance(getattr(context, "latest_prices", None), dict):
                 context.latest_prices[TARGET_SYMBOL] = fresh_p
@@ -197,7 +409,12 @@ def _compute_nearest_sell_target_price(
     sub_buckets: Optional[Sequence[StratumBucket]] = None,
 ) -> float:
     candidates: List[float] = []
-    l1_mult = 1.0 + max(0.1, safe_float(rise_l1_pct, 1.50)) / 100.0
+    eff_l1_pct = (
+        SNIPER_L1_TRAIL_IGNITE_PCT
+        if (SNIPER_L1_TRAIL_ENABLED and not is_overnight_session)
+        else safe_float(rise_l1_pct, 1.50)
+    )
+    l1_mult = 1.0 + max(0.1, eff_l1_pct) / 100.0
     up_mult = 1.0 + max(0.1, safe_float(rise_upper_pct, 1.00)) / 100.0
 
     if buckets:
@@ -474,6 +691,7 @@ def mark_post_sell_time_shield(
     global _LAST_CONSUMED_WICK_TRADE_TS
 
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    reset_sniper_l1_trail_slots(context, grid_kind="ALL", symbol=sym)
     now_mono = time.monotonic()
     now_epoch = time.time()
     _LAST_CONSUMED_WICK_TRADE_TS = max(_LAST_CONSUMED_WICK_TRADE_TS, now_epoch)
@@ -1429,12 +1647,16 @@ async def _commit_filled_sell_and_reanchor_ledger(
         safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
     )
 
-    # 바벨 모드 가동 중 발생한 세후 수익금은 별도 수익금고로 격리 오프셋 동기화
+    # MODIFIED: 수동 부분손절(prev_cyc_net < 0) 후 익절 시 코어 결손 우선 보전 후 순흑자만 금고 격리
+    prev_cyc_net_b = safe_float(st.get("cycle_realized_net_usd"), 0.0)
+    vault_delta_pnl = round(
+        max(0.0, net_pnl + min(0.0, prev_cyc_net_b)), 4
+    )
     prev_vault_locked = max(
         0.0, safe_float(st.get("vaulted_profit_locked_usd"), 0.0)
     )
     next_vault_locked = (
-        round(prev_vault_locked + max(0.0, net_pnl), 4)
+        round(prev_vault_locked + vault_delta_pnl, 4)
         if is_barbell
         else prev_vault_locked
     )
@@ -1500,7 +1722,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
     next_inj_res_usd = cur_inj_res_usd
     next_used_res_cnt = cur_used_res_cnt
 
-    if is_graduated_zero and cur_inj_res_usd > 0.0:
+    if (not is_barbell) and is_graduated_zero and cur_inj_res_usd > 0.0:
         repay_info = compute_reserve_repayment_on_zero(
             initial_seed_usd=init_seed,
             cumulative_realized_net_usd=cum_net,
@@ -1618,24 +1840,44 @@ async def _commit_filled_sell_and_reanchor_ledger(
         TARGET_SYMBOL, **update_kwargs
     )
 
-    # [바벨 모드 전용 훅] 별도 수익금고 영구 격리 및 0주 졸업 시 60 / 30 / 10 자동 리밸런싱 실행
+    # [바벨 모드 전용 훅] 별도 수익금고 영구 격리 및 전 구간(부분 익절 · 0주 졸업) 실시간 60/30/10 리밸런싱 실행
     barbell_vault_total = next_vault_locked
     repaid_to_vault_usd = 0.0
     pending_sgov_reb_usd = 0.0
+    added_sgov_reb_usd = 0.0
+    barbell_cash_b_usd = 0.0
     if is_barbell:
         barbell_rec = await record_barbell_realized_profit(
             context=context,
-            net_pnl_usd=net_pnl,
+            net_pnl_usd=vault_delta_pnl,  # MODIFIED: 유령현금 이중계상 차단
             is_graduated_zero=is_graduated_zero,
+            prev_soxl_injected_usd=cur_inj_res_usd,
+            prev_soxl_used_portions_cnt=cur_used_res_cnt,
+            cycle_realized_net_override=cur_cyc_net,
         )
         barbell_vault_total = safe_float(
             barbell_rec.get("vault_realized_profit_usd"), next_vault_locked
+        )
+        repaid_this_time = safe_float(
+            barbell_rec.get("repaid_from_soxl_usd"), 0.0
+        )
+        next_inj_res_usd = safe_float(
+            barbell_rec.get("rem_soxl_injected_usd"), 0.0
+        )
+        next_used_res_cnt = safe_int(
+            barbell_rec.get("rem_soxl_used_portions_cnt"), 0
         )
         repaid_to_vault_usd = safe_float(
             barbell_rec.get("repaid_to_vault_usd"), 0.0
         )
         pending_sgov_reb_usd = safe_float(
             barbell_rec.get("pending_sgov_buy_budget_usd"), 0.0
+        )
+        added_sgov_reb_usd = safe_float(
+            barbell_rec.get("added_sgov_buy_budget_usd"), 0.0
+        )
+        barbell_cash_b_usd = safe_float(
+            barbell_rec.get("cash_bucket_usd"), 0.0
         )
         updated_st = context.ledger.get_state(TARGET_SYMBOL)
 
@@ -1684,8 +1926,24 @@ async def _commit_filled_sell_and_reanchor_ledger(
         sess_tag = " · 🌃장외익절" if is_ext_sell else ""
 
         if is_barbell:
+            rt_reb_note = ""
+            if not is_graduated_zero and repaid_this_time > 0.0:
+                sgov_add_note = (
+                    f"➔SGOV예약 +${added_sgov_reb_usd:,.0f}(총 ${pending_sgov_reb_usd:,.0f})"
+                    if added_sgov_reb_usd > 0.0
+                    else ""
+                )
+                vault_rep_note = (
+                    f"·금고원복 ${repaid_to_vault_usd:,.0f}"
+                    if repaid_to_vault_usd > 0.0
+                    else ""
+                )
+                rt_reb_note = (
+                    f" · ⚡실시간환수 ${repaid_this_time:,.0f}"
+                    f"(현금버킷 ${barbell_cash_b_usd:,.0f}{sgov_add_note}{vault_rep_note})"
+                )
             credit_mode_desc = (
-                f"별도 수익금고 영구격리!(⚖️바벨 · 누적금고 +${barbell_vault_total:,.2f})"
+                f"별도 수익금고 영구격리!(⚖️바벨 · 누적금고 +${barbell_vault_total:,.2f}){rt_reb_note}"
             )
             cash_lbl = "바벨SOXL현금"
         elif is_simple_mode:
@@ -1697,7 +1955,7 @@ async def _commit_filled_sell_and_reanchor_ledger(
             credit_mode_desc = "시드 복리산입!"
             cash_lbl = "가용현금"
 
-        if is_sub_without_main_sell:
+        if is_sub_without_main_sell and not is_graduated_zero:
             grid_sh = sum(b.qty for b in rem_buckets)
             sub_sh = sum(sb.qty for sb in rem_sub_buckets)
             if is_sub_empty:
@@ -1927,23 +2185,49 @@ async def sync_pending_sell_order_plugin(
                 except Exception:
                     pass
                 final_det = await context.api.get_order_detail(sell_oid)
-                if isinstance(final_det, dict):
-                    f_ex = (
-                        final_det.get("execution")
-                        if isinstance(final_det.get("execution"), dict)
-                        else {}
+                f_st2 = (
+                    str(final_det.get("status") or "").upper().strip()
+                    if isinstance(final_det, dict)
+                    else ""
+                )
+                if not isinstance(final_det, dict) or f_st2 in (
+                    "PENDING",
+                    "PARTIAL_FILLED",
+                    "PENDING_CANCEL",
+                    "PENDING_REPLACE",
+                ):
+                    await asyncio.sleep(0.35)
+                    final_det = await context.api.get_order_detail(sell_oid)
+                    f_st2 = (
+                        str(final_det.get("status") or "").upper().strip()
+                        if isinstance(final_det, dict)
+                        else ""
                     )
-                    f_q2 = safe_int(f_ex.get("filledQuantity"), filled_q)
-                    f_p2 = safe_float(
-                        f_ex.get("averageFilledPrice"), avg_fill_p
-                    )
-                    f_fee2 = _extract_actual_sell_fee_from_exec(f_ex)
-                    if f_q2 > 0:
-                        filled_q = f_q2
-                    if f_p2 > 0.0:
-                        avg_fill_p = f_p2
-                    if f_fee2 is not None:
-                        actual_fee_val = f_fee2
+                if not isinstance(final_det, dict) or f_st2 in (
+                    "PENDING",
+                    "PARTIAL_FILLED",
+                    "PENDING_CANCEL",
+                    "PENDING_REPLACE",
+                ):
+                    return {
+                        "status": "SELL_PARTIAL_CANCEL_CONFIRMING",
+                        "did_sell_or_ratchet": True,
+                        "orderId": sell_oid,
+                    }
+                f_ex = (
+                    final_det.get("execution")
+                    if isinstance(final_det.get("execution"), dict)
+                    else {}
+                )
+                f_q2 = safe_int(f_ex.get("filledQuantity"), filled_q)
+                f_p2 = safe_float(f_ex.get("averageFilledPrice"), avg_fill_p)
+                f_fee2 = _extract_actual_sell_fee_from_exec(f_ex)
+                if f_q2 > 0:
+                    filled_q = f_q2
+                if f_p2 > 0.0:
+                    avg_fill_p = f_p2
+                if f_fee2 is not None:
+                    actual_fee_val = f_fee2
                 if filled_q > 0:
                     eff_p = avg_fill_p if avg_fill_p > 0.0 else target_p
                     return await _commit_filled_sell_and_reanchor_ledger(
@@ -1962,7 +2246,10 @@ async def sync_pending_sell_order_plugin(
                     "ordered_qty": ordered_qty,
                 }
 
-        if ord_status in ("CANCELED", "REJECTED") and filled_q == 0:
+        if (
+            ord_status in ("CANCELED", "REJECTED", "REPLACED")
+            and filled_q == 0
+        ):
             if ord_status == "REJECTED":
                 mark_extended_sell_restriction_cooldown(
                     context,
@@ -1970,6 +2257,9 @@ async def sync_pending_sell_order_plugin(
                     cooldown_sec=EXTENDED_SELL_RESTRICTION_COOLDOWN_SEC,
                     reason="SELL_ORDER_REJECTED",
                 )
+            reset_sniper_l1_trail_slots(
+                context, grid_kind="ALL", symbol=TARGET_SYMBOL
+            )
             await context.ledger.update_state(
                 TARGET_SYMBOL,
                 sell_order_id="",
@@ -1992,8 +2282,51 @@ async def sync_pending_sell_order_plugin(
             pass
 
         final_detail = await context.api.get_order_detail(sell_oid)
+        f_status = (
+            str(final_detail.get("status") or "").upper().strip()
+            if isinstance(final_detail, dict)
+            else ""
+        )
+        if not isinstance(final_detail, dict) or f_status in (
+            "PENDING",
+            "PARTIAL_FILLED",
+            "PENDING_CANCEL",
+            "PENDING_REPLACE",
+        ):
+            await asyncio.sleep(0.35)
+            final_detail = await context.api.get_order_detail(sell_oid)
+            f_status = (
+                str(final_detail.get("status") or "").upper().strip()
+                if isinstance(final_detail, dict)
+                else ""
+            )
+
+        if not isinstance(final_detail, dict) and elapsed_mod >= (
+            SELL_ORDER_MAX_WAIT_SEC + 15.0
+        ):
+            closed_cands = await context.api.get_closed_orders(
+                symbol=TARGET_SYMBOL, limit=25
+            )
+            for c_item in closed_cands:
+                if str(c_item.get("orderId") or "").strip() == sell_oid:
+                    final_detail = c_item
+                    f_status = (
+                        str(c_item.get("status") or "").upper().strip()
+                    )
+                    break
+
         if isinstance(final_detail, dict):
-            f_status = str(final_detail.get("status") or "").upper().strip()
+            if f_status in (
+                "PENDING",
+                "PARTIAL_FILLED",
+                "PENDING_CANCEL",
+                "PENDING_REPLACE",
+            ):
+                return {
+                    "status": "SELL_CANCEL_IN_FLIGHT",
+                    "did_sell_or_ratchet": True,
+                    "orderId": sell_oid,
+                }
             f_exec = (
                 final_detail.get("execution")
                 if isinstance(final_detail.get("execution"), dict)
@@ -2011,7 +2344,16 @@ async def sync_pending_sell_order_plugin(
                     settled_order_id=sell_oid,
                     actual_sell_fee_usd=f_fee,
                 )
+        elif elapsed_mod < (SELL_ORDER_MAX_WAIT_SEC + 30.0):
+            return {
+                "status": "SELL_CANCEL_VERIFY_RETRY",
+                "did_sell_or_ratchet": True,
+                "orderId": sell_oid,
+            }
 
+        reset_sniper_l1_trail_slots(
+            context, grid_kind="ALL", symbol=TARGET_SYMBOL
+        )
         await context.ledger.update_state(
             TARGET_SYMBOL,
             sell_order_id="",
@@ -2038,8 +2380,157 @@ async def sync_pending_sell_order_plugin(
     }
 
 
+async def _get_closed_1m_ha_and_qqq_snapshot(
+    context: Any,
+    live_p: float,
+    dt_now: datetime,
+) -> Tuple[str, bool, bool, float]:
+    """
+    # NEW [Case 99 : 완결 1분봉(closed_bar_minute_key) 확정 HA 음봉 여부 및 QQQ 단기 변화율 추출기]
+    반환값: (closed_bar_minute_key, closed_ha_ready, closed_ha_bull, qqq_vel_max_pct)
+    """
+    global _LAST_EXIT_CANDLE_WARM_MONO
+    raw_cache = getattr(context, "candle_metrics_cache", None)
+    soxl_met = (
+        raw_cache.get(TARGET_SYMBOL) if isinstance(raw_cache, dict) else None
+    )
+    now_m = time.monotonic()
+
+    if (
+        (
+            not isinstance(soxl_met, dict)
+            or not bool(soxl_met.get("closed_ha_ready", False))
+        )
+        and (now_m - _LAST_EXIT_CANDLE_WARM_MONO) >= 10.0
+        and hasattr(context, "api")
+    ):
+        _LAST_EXIT_CANDLE_WARM_MONO = now_m
+        try:
+            from quant_indicators_plugin import compute_soxl_quant_metrics_1m
+
+            # MODIFIED: 400분봉 + 10일봉 표준 워밍업 통일 (SHM req_cnt 축소 오염 차단)
+            c_1m = await context.api.get_candles_1m(
+                symbol=TARGET_SYMBOL, total_count=400
+            )
+            c_1d = (
+                await context.api.get_candles_1d(
+                    symbol=TARGET_SYMBOL, count=10
+                )
+                if hasattr(context.api, "get_candles_1d")
+                else []
+            )
+            if c_1m or c_1d:
+                soxl_met = await asyncio.to_thread(
+                    compute_soxl_quant_metrics_1m,
+                    c_1m or [],
+                    live_p,
+                    dt_now,
+                    c_1d or [],
+                )
+                if isinstance(raw_cache, dict):
+                    raw_cache[TARGET_SYMBOL] = soxl_met
+        except Exception:
+            pass
+
+    if isinstance(soxl_met, dict) and live_p > 0.0:
+        soxl_met = refresh_metrics_with_live_tick(
+            soxl_met, live_p, now_est=dt_now, symbol=TARGET_SYMBOL
+        )
+        if isinstance(raw_cache, dict):
+            raw_cache[TARGET_SYMBOL] = soxl_met
+
+    closed_mk = (
+        str(soxl_met.get("closed_bar_minute_key") or "").strip()
+        if isinstance(soxl_met, dict)
+        else ""
+    )
+    closed_ready = (
+        bool(soxl_met.get("closed_ha_ready", False))
+        if isinstance(soxl_met, dict)
+        else False
+    )
+    closed_bull = (
+        bool(soxl_met.get("closed_ha_bull", True))
+        if isinstance(soxl_met, dict)
+        else True
+    )
+    qqq_met = (
+        raw_cache.get("QQQ") if isinstance(raw_cache, dict) else None
+    )
+    qqq_vel_max = (
+        safe_float(qqq_met.get("vel_max_3m_10m_pct"), 0.0)
+        if isinstance(qqq_met, dict)
+        else 0.0
+    )
+    return closed_mk, closed_ready, closed_bull, qqq_vel_max
+
+
+def _step_l1_trail_slot_candidate(
+    slot: SniperL1TrailSlot,
+    live_p: float,
+    wick_high_p: float,
+    cur_min_key: str,
+    closed_min_key: str,
+    closed_ha_ready: bool,
+    closed_ha_bull: bool,
+    qqq_vel_max: float,
+) -> Tuple[str, bool]:
+    """
+    # NEW [Case 99 : 🛡️ ⑥ 하드보존(1%➔1.25%) + 완결 1분봉 HA 음봉 + 콜백 1차 후보 판정기]
+    반환값: (trigger_code, just_ignited)
+    """
+    if slot.qty <= 0 or slot.ref_cost <= 0.0 or live_p <= 0.0:
+        return "", False
+
+    probe_h = max(live_p, safe_float(wick_high_p, 0.0))
+
+    if not slot.armed:
+        if probe_h < slot.arm_100_p - 1e-9:
+            return "", False
+        if probe_h >= slot.cap_500_p - 1e-9:
+            slot.armed = True
+            slot.armed_minute_key = cur_min_key
+            slot.peak_p = probe_h
+            slot.stepped_125 = True
+            slot.lock_floor_p = slot.lock_125_p
+            slot.refresh_stop_price()
+            return "TRAIL_CAP_500", True
+
+        slot.armed = True
+        slot.armed_minute_key = cur_min_key
+        slot.peak_p = max(probe_h, slot.arm_100_p)
+        slot.lock_floor_p = slot.arm_100_p
+        slot.stepped_125 = False
+        stop_now = slot.refresh_stop_price()
+        if wick_high_p > live_p and live_p <= stop_now + 1e-9:
+            return "TRAIL_CB_STOP", True
+        return "", True
+
+    slot.peak_p = max(slot.peak_p, probe_h)
+    stop_now = slot.refresh_stop_price()
+
+    if probe_h >= slot.cap_500_p - 1e-9:
+        return "TRAIL_CAP_500", False
+
+    if stop_now > 0.0 and live_p <= stop_now + 1e-9:
+        return "TRAIL_CB_STOP", False
+
+    if (
+        closed_ha_ready
+        and (not closed_ha_bull)
+        and bool(closed_min_key)
+        and bool(slot.armed_minute_key)
+        and (closed_min_key > slot.armed_minute_key)
+        and (closed_min_key != slot.forgiven_ha_minute_key)
+        and (qqq_vel_max < SNIPER_L1_TRAIL_QQQ_BYPASS_PCT)
+    ):
+        return "TRAIL_CLOSED_HA_RED", False
+
+    return "", False
+
+
 # ---------------------------------------------------------------------------
-# [핵심 3] 24시간 전 세션 매수 후 최초 60초 타임쉴드 & 이후 보유 중 매 1.5초 실시간 다중 익절(본+서브) + 방안 C 오버나이트 통합이평 사수 + 윗꼬리 즉시 체결 모니터
+# [핵심 3] 24시간 전 세션 매수 후 최초 60초 타임쉴드 & 주간 1층 챔피언 ⑥ 트레일링(하드보존+완결1분HA+용서·망각) + 방안 C 오버나이트 통합이평 사수 모니터
 # ---------------------------------------------------------------------------
 async def execute_1m_sniper_sell_and_reanchor_plugin(
     context: Any,
@@ -2051,8 +2542,12 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
 
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     hm = dt_now.hour * 100 + dt_now.minute
+    cur_min_key = dt_now.strftime("%Y-%m-%d %H:%M")
 
     st = context.ledger.get_state(TARGET_SYMBOL)
+    main_slot, sub_slot = get_sniper_l1_trail_slots(
+        context, symbol=TARGET_SYMBOL
+    )
 
     if str(st.get("sell_order_id") or "").strip():
         return await sync_pending_sell_order_plugin(
@@ -2063,6 +2558,8 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         )
 
     if not is_active_sell_window(hm, now_est=dt_now):
+        main_slot.release_overnight()
+        sub_slot.release_overnight()
         return {
             "status": "OUTSIDE_TRADING_WINDOW",
             "did_sell_or_ratchet": False,
@@ -2080,6 +2577,8 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
     buckets = buckets_from_dicts(st.get("buckets", []))
     sub_buckets = buckets_from_dicts(st.get("sub_buckets", []))
     if not buckets and not sub_buckets:
+        main_slot.full_reset()
+        sub_slot.full_reset()
         return {"status": "NO_BUCKETS_HELD", "did_sell_or_ratchet": False}
 
     in_ext_cd, rem_ext_cd = is_within_extended_sell_restriction_cooldown(
@@ -2103,6 +2602,25 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         }
 
     is_ext_sell_only = is_extended_sell_only_window(hm, now_est=dt_now)
+    use_daytime_l1_trail = bool(
+        SNIPER_L1_TRAIL_ENABLED and (not is_ext_sell_only)
+    )
+    if is_ext_sell_only:
+        main_slot.release_overnight()
+        sub_slot.release_overnight()
+
+    if buckets and has_active_l1_bucket(buckets):
+        main_slot.sync_fingerprint(buckets[0].qty, buckets[0].book_price)
+    else:
+        main_slot.full_reset()
+
+    if sub_buckets and has_active_l1_bucket(sub_buckets):
+        sub_slot.sync_fingerprint(
+            sub_buckets[0].qty, sub_buckets[0].book_price
+        )
+    else:
+        sub_slot.full_reset()
+
     live_p = _get_live_soxl_price(
         context,
         prices,
@@ -2150,6 +2668,7 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         cycle_ratchet_max_lots=ratchet_max_lots,
     )
 
+    # [1순위 & 3순위] 상단 2~7층(서브 2~3층) 통합이평 전량 졸업 및 개별 상단층 판정
     sell_eval = evaluate_multi_grid_sell_targets(
         buckets=buckets,
         live_price=live_p,
@@ -2157,6 +2676,7 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         rise_upper_pct=rise_sell_upper_pct,
         is_overnight_session=is_ext_sell_only,
         sub_buckets=sub_buckets,
+        exclude_daytime_l1=use_daytime_l1_trail,
     )
 
     wick_high_p: float = 0.0
@@ -2170,56 +2690,152 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
     )
     triggered_by_wick_only: bool = False
 
-    if not bool(sell_eval.get("should_sell")):
-        if nearest_target_p > 0.0 and live_p >= (
-            nearest_target_p * WICK_PROXIMITY_TRIGGER_RATIO
+    need_wick_probe = bool(
+        not bool(sell_eval.get("should_sell"))
+        and nearest_target_p > 0.0
+        and live_p >= (nearest_target_p * WICK_PROXIMITY_TRIGGER_RATIO)
+    )
+    if (
+        not need_wick_probe
+        and use_daytime_l1_trail
+        and (
+            (
+                main_slot.armed
+                and not main_slot.stepped_125
+                and live_p
+                >= main_slot.step_trig_145_p * WICK_PROXIMITY_TRIGGER_RATIO
+            )
+            or (
+                sub_slot.armed
+                and not sub_slot.stepped_125
+                and live_p
+                >= sub_slot.step_trig_145_p * WICK_PROXIMITY_TRIGGER_RATIO
+            )
+        )
+    ):
+        need_wick_probe = True
+
+    if need_wick_probe:
+        min_trade_after_ts = max(
+            safe_float(st.get("last_buy_fill_ts"), 0.0),
+            safe_float(st.get("last_sub_buy_fill_ts"), 0.0),
+            safe_float(st.get("last_sell_fill_ts"), 0.0),
+            safe_float(st.get("last_sub_sell_fill_ts"), 0.0),
+            safe_float(st.get("entry_ts"), 0.0),
+            _LAST_CONSUMED_WICK_TRADE_TS,
+        )
+        wick_high_p, wick_trade_ts = (
+            await _probe_recent_trade_wick_high_soxl(
+                context=context,
+                min_after_ts=min_trade_after_ts,
+                lookback_sec=WICK_TRADE_LOOKBACK_SEC,
+                count=WICK_TRADE_FETCH_COUNT,
+            )
+        )
+        if (
+            not bool(sell_eval.get("should_sell"))
+            and nearest_target_p > 0.0
+            and wick_high_p >= nearest_target_p
+            and wick_high_p > live_p
         ):
-            min_trade_after_ts = max(
-                safe_float(st.get("last_buy_fill_ts"), 0.0),
-                safe_float(st.get("last_sub_buy_fill_ts"), 0.0),
-                safe_float(st.get("last_sell_fill_ts"), 0.0),
-                safe_float(st.get("last_sub_sell_fill_ts"), 0.0),
-                safe_float(st.get("entry_ts"), 0.0),
-                _LAST_CONSUMED_WICK_TRADE_TS,
+            wick_eval = evaluate_multi_grid_sell_targets(
+                buckets=buckets,
+                live_price=nearest_target_p,
+                rise_l1_pct=rise_sell_l1_pct,
+                rise_upper_pct=rise_sell_upper_pct,
+                is_overnight_session=is_ext_sell_only,
+                sub_buckets=sub_buckets,
+                exclude_daytime_l1=use_daytime_l1_trail,
             )
-            wick_high_p, wick_trade_ts = (
-                await _probe_recent_trade_wick_high_soxl(
-                    context=context,
-                    min_after_ts=min_trade_after_ts,
-                    lookback_sec=WICK_TRADE_LOOKBACK_SEC,
-                    count=WICK_TRADE_FETCH_COUNT,
-                )
-            )
-            if wick_high_p >= nearest_target_p and wick_high_p > live_p:
+            if not bool(wick_eval.get("should_sell")):
                 wick_eval = evaluate_multi_grid_sell_targets(
                     buckets=buckets,
-                    live_price=nearest_target_p,
+                    live_price=wick_high_p,
                     rise_l1_pct=rise_sell_l1_pct,
                     rise_upper_pct=rise_sell_upper_pct,
                     is_overnight_session=is_ext_sell_only,
                     sub_buckets=sub_buckets,
+                    exclude_daytime_l1=use_daytime_l1_trail,
                 )
-                if not bool(wick_eval.get("should_sell")):
-                    wick_eval = evaluate_multi_grid_sell_targets(
-                        buckets=buckets,
-                        live_price=wick_high_p,
-                        rise_l1_pct=rise_sell_l1_pct,
-                        rise_upper_pct=rise_sell_upper_pct,
-                        is_overnight_session=is_ext_sell_only,
-                        sub_buckets=sub_buckets,
-                    )
-                if bool(wick_eval.get("should_sell")):
-                    sell_eval = wick_eval
-                    triggered_by_wick_only = True
-                    logger.info(
-                        "⚡ [Case 82 1분봉 윗꼬리 체결틱 포착!] 스냅샷현재가=$%.2f < 목표가($%.2f) 이나 최근 %.1f초 내 체결최고가=$%.2f 감지 -> 즉시 목표하한가로 지정가 매도 격발!",
-                        live_p,
-                        nearest_target_p,
-                        WICK_TRADE_LOOKBACK_SEC,
-                        wick_high_p,
-                    )
+            if bool(wick_eval.get("should_sell")):
+                sell_eval = wick_eval
+                triggered_by_wick_only = True
+                logger.info(
+                    "⚡ [Case 82 1분봉 윗꼬리 체결틱 포착!] 스냅샷현재가=$%.2f < 목표가($%.2f) 이나 최근 %.1f초 내 체결최고가=$%.2f 감지 -> 즉시 목표하한가로 지정가 매도 격발!",
+                    live_p,
+                    nearest_target_p,
+                    WICK_TRADE_LOOKBACK_SEC,
+                    wick_high_p,
+                )
 
-    if bool(sell_eval.get("should_sell")):
+    # [2순위 · Case 99] 평일 04:07 ~ 16:00 EST 본 1층 · 서브 1층 스텝 락온 트레일링 & "허락보다 용서를" 평가
+    main_trail_trig = ""
+    sub_trail_trig = ""
+    just_ignited_any = False
+    forgiven_any = False
+
+    if use_daytime_l1_trail:
+        closed_mk, closed_ready, closed_bull, qqq_vel_max = (
+            await _get_closed_1m_ha_and_qqq_snapshot(context, live_p, dt_now)
+        )
+        if bool(sell_eval.get("hit_wma_grad")):
+            main_slot.full_reset()
+        elif main_slot.qty > 0:
+            main_trail_trig, ign_m = _step_l1_trail_slot_candidate(
+                slot=main_slot,
+                live_p=live_p,
+                wick_high_p=wick_high_p,
+                cur_min_key=cur_min_key,
+                closed_min_key=closed_mk,
+                closed_ha_ready=closed_ready,
+                closed_ha_bull=closed_bull,
+                qqq_vel_max=qqq_vel_max,
+            )
+            if ign_m:
+                just_ignited_any = True
+                logger.info(
+                    "🔥 [Case 99 SOXL 본 1층 트레일링 점화] 단가=$%.2f ➔ 보존선=$%.2f(1.25%%락=$%.2f) · 점화분=%s · 0.40s 추적 개시",
+                    main_slot.ref_cost,
+                    main_slot.lock_floor_p,
+                    main_slot.lock_125_p,
+                    main_slot.armed_minute_key,
+                )
+
+        if bool(sell_eval.get("hit_sub_wma_grad")):
+            sub_slot.full_reset()
+        elif sub_slot.qty > 0:
+            sub_trail_trig, ign_s = _step_l1_trail_slot_candidate(
+                slot=sub_slot,
+                live_p=live_p,
+                wick_high_p=wick_high_p,
+                cur_min_key=cur_min_key,
+                closed_min_key=closed_mk,
+                closed_ha_ready=closed_ready,
+                closed_ha_bull=closed_bull,
+                qqq_vel_max=qqq_vel_max,
+            )
+            if ign_s:
+                just_ignited_any = True
+                logger.info(
+                    "🔥 [Case 99 SOXL 서브 1층 트레일링 점화] 단가=$%.2f ➔ 보존선=$%.2f(1.25%%락=$%.2f) · 점화분=%s · 0.40s 추적 개시",
+                    sub_slot.ref_cost,
+                    sub_slot.lock_floor_p,
+                    sub_slot.lock_125_p,
+                    sub_slot.armed_minute_key,
+                )
+
+        if just_ignited_any and hasattr(context, "wakeup_event"):
+            context.wakeup_event.set()
+    else:
+        closed_mk = ""
+        closed_ready = False
+        closed_bull = True
+
+    if (
+        bool(sell_eval.get("should_sell"))
+        or bool(main_trail_trig)
+        or bool(sub_trail_trig)
+    ):
         fresh_live_p = await _fetch_fresh_current_soxl_price(
             context,
             fallback_price=live_p,
@@ -2227,41 +2843,184 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
         if fresh_live_p <= 0.0:
             fresh_live_p = live_p
 
-        fresh_only_eval = evaluate_multi_grid_sell_targets(
-            buckets=buckets,
-            live_price=fresh_live_p,
-            rise_l1_pct=rise_sell_l1_pct,
-            rise_upper_pct=rise_sell_upper_pct,
-            is_overnight_session=is_ext_sell_only,
-            sub_buckets=sub_buckets,
-        )
-        if bool(fresh_only_eval.get("should_sell")):
-            sell_eval = fresh_only_eval
-            triggered_by_wick_only = False
-        elif nearest_target_p > 0.0:
-            lowest_tier_eval = evaluate_multi_grid_sell_targets(
+        if bool(sell_eval.get("should_sell")):
+            fresh_only_eval = evaluate_multi_grid_sell_targets(
                 buckets=buckets,
-                live_price=nearest_target_p,
+                live_price=fresh_live_p,
                 rise_l1_pct=rise_sell_l1_pct,
                 rise_upper_pct=rise_sell_upper_pct,
                 is_overnight_session=is_ext_sell_only,
                 sub_buckets=sub_buckets,
+                exclude_daytime_l1=use_daytime_l1_trail,
             )
-            if bool(lowest_tier_eval.get("should_sell")):
-                sell_eval = lowest_tier_eval
+            if bool(fresh_only_eval.get("should_sell")):
+                sell_eval = fresh_only_eval
+                triggered_by_wick_only = False
+            elif nearest_target_p > 0.0:
+                lowest_tier_eval = evaluate_multi_grid_sell_targets(
+                    buckets=buckets,
+                    live_price=nearest_target_p,
+                    rise_l1_pct=rise_sell_l1_pct,
+                    rise_upper_pct=rise_sell_upper_pct,
+                    is_overnight_session=is_ext_sell_only,
+                    sub_buckets=sub_buckets,
+                    exclude_daytime_l1=use_daytime_l1_trail,
+                )
+                if bool(lowest_tier_eval.get("should_sell")):
+                    sell_eval = lowest_tier_eval
 
-        sold_indices = list(sell_eval.get("sold_indices") or [])
-        sub_sold_indices = list(sell_eval.get("sub_sold_indices") or [])
-        sell_qty = max(1, safe_int(sell_eval.get("sell_qty"), 1))
+        sold_idx_set: Set[int] = set(sell_eval.get("sold_indices") or [])
+        sub_sold_idx_set: Set[int] = set(
+            sell_eval.get("sub_sold_indices") or []
+        )
+        floor_cands: List[float] = []
+        if bool(sell_eval.get("should_sell")) and safe_float(
+            sell_eval.get("min_floor_price"), 0.0
+        ) > 0.0:
+            floor_cands.append(
+                safe_float(sell_eval.get("min_floor_price"), 0.0)
+            )
+
+        bad_ha_mk = (
+            closed_mk
+            if (closed_ready and (not closed_bull) and bool(closed_mk))
+            else ""
+        )
+        fired_main_trail = False
+        fired_sub_trail = False
+
+        # [본 1층 2차 실호가 검문 및 "허락보다 용서를" 분기]
+        if (
+            main_trail_trig
+            and not bool(sell_eval.get("hit_wma_grad"))
+            and buckets
+            and has_active_l1_bucket(buckets)
+        ):
+            main_slot.peak_p = max(main_slot.peak_p, fresh_live_p)
+            m_stop = main_slot.refresh_stop_price()
+            if fresh_live_p < main_slot.arm_100_p - 1e-9:
+                main_slot.release_forgive(bad_ha_minute_key=bad_ha_mk)
+                forgiven_any = True
+                logger.info(
+                    "💡 [Case 99 본 1층 '허락보다 용서를' 릴리스 & 기존 HA 망각] 실호가=$%.2f < +1.00%%($%.2f) -> 허공주문 차단 · 망각봉=%s",
+                    fresh_live_p,
+                    main_slot.arm_100_p,
+                    bad_ha_mk or "-",
+                )
+            elif (
+                main_trail_trig == "TRAIL_CB_STOP"
+                and fresh_live_p > m_stop + 1e-9
+            ):
+                pass
+            else:
+                m_eff_fl = (
+                    main_slot.cap_500_p
+                    if (
+                        main_trail_trig == "TRAIL_CAP_500"
+                        and fresh_live_p >= main_slot.cap_500_p - 1e-9
+                    )
+                    else (
+                        main_slot.lock_floor_p
+                        if fresh_live_p >= main_slot.lock_floor_p - 1e-9
+                        else main_slot.arm_100_p
+                    )
+                )
+                sold_idx_set.add(0)
+                floor_cands.append(m_eff_fl)
+                fired_main_trail = True
+
+        # [서브 1층 2차 실호가 검문 및 "허락보다 용서를" 분기]
+        if (
+            sub_trail_trig
+            and not bool(sell_eval.get("hit_sub_wma_grad"))
+            and sub_buckets
+            and has_active_l1_bucket(sub_buckets)
+        ):
+            sub_slot.peak_p = max(sub_slot.peak_p, fresh_live_p)
+            s_stop = sub_slot.refresh_stop_price()
+            if fresh_live_p < sub_slot.arm_100_p - 1e-9:
+                sub_slot.release_forgive(bad_ha_minute_key=bad_ha_mk)
+                forgiven_any = True
+                logger.info(
+                    "💡 [Case 99 서브 1층 '허락보다 용서를' 릴리스 & 기존 HA 망각] 실호가=$%.2f < +1.00%%($%.2f) -> 허공주문 차단 · 망각봉=%s",
+                    fresh_live_p,
+                    sub_slot.arm_100_p,
+                    bad_ha_mk or "-",
+                )
+            elif (
+                sub_trail_trig == "TRAIL_CB_STOP"
+                and fresh_live_p > s_stop + 1e-9
+            ):
+                pass
+            else:
+                s_eff_fl = (
+                    sub_slot.cap_500_p
+                    if (
+                        sub_trail_trig == "TRAIL_CAP_500"
+                        and fresh_live_p >= sub_slot.cap_500_p - 1e-9
+                    )
+                    else (
+                        sub_slot.lock_floor_p
+                        if fresh_live_p >= sub_slot.lock_floor_p - 1e-9
+                        else sub_slot.arm_100_p
+                    )
+                )
+                sub_sold_idx_set.add(0)
+                floor_cands.append(s_eff_fl)
+                fired_sub_trail = True
+
+        if not sold_idx_set and not sub_sold_idx_set:
+            return {
+                "status": (
+                    "MONITORING_RELEASED_FORGIVEN"
+                    if forgiven_any
+                    else "MONITORING_0_4S_L1_STEP_TRAIL"
+                ),
+                "did_sell_or_ratchet": False,
+                "forgiven_release": forgiven_any,
+            }
+
+        sold_indices = sorted(sold_idx_set)
+        sub_sold_indices = sorted(sub_sold_idx_set)
+        sell_qty = max(
+            1,
+            sum(buckets[i].qty for i in sold_indices if i < len(buckets))
+            + sum(
+                sub_buckets[si].qty
+                for si in sub_sold_indices
+                if si < len(sub_buckets)
+            ),
+        )
+        raw_min_fl = max(floor_cands) if floor_cands else fresh_live_p
         min_floor_p = max(
             0.01,
-            math.ceil(
-                (safe_float(sell_eval.get("min_floor_price"), live_p) - 1e-9)
-                * 100.0
-            )
-            / 100.0,
+            math.ceil((raw_min_fl - 1e-9) * 100.0) / 100.0,
         )
-        reason_tag = str(sell_eval.get("reason_tag") or "SELL_L1_ONLY")
+
+        if bool(sell_eval.get("should_sell")):
+            base_tag = str(sell_eval.get("reason_tag") or "SELL_L1_ONLY")
+            if (fired_main_trail or fired_sub_trail) and base_tag in (
+                "SELL_GRID_INDIV",
+                "SELL_SUB_GRID_INDIV",
+            ):
+                reason_tag = (
+                    "SELL_SUB_L1_AND_GRID"
+                    if (sub_sold_indices and not sold_indices)
+                    else "SELL_L1_AND_GRID"
+                )
+            else:
+                reason_tag = base_tag
+        elif fired_sub_trail and not fired_main_trail:
+            reason_tag = (
+                "SELL_SUB_ALL_GRAD"
+                if len(sub_sold_indices) == len(sub_buckets)
+                and len(sub_buckets) > 1
+                else "SELL_SUB_L1_ONLY"
+            )
+        elif fired_main_trail and fired_sub_trail:
+            reason_tag = "SELL_MAIN_AND_SUB"
+        else:
+            reason_tag = "SELL_L1_ONLY" 
 
         if fresh_live_p > (min_floor_p * MARKETABLE_GAP_UP_THRESHOLD_MULT):
             gap_exec_p = max(
@@ -2288,6 +3047,13 @@ async def execute_1m_sniper_sell_and_reanchor_plugin(
             "NEW_SELL_SWEEP_OK",
             "SELL_ORDER_ALREADY_ACTIVE",
         )
+        if did_order:
+            if 0 in sold_indices or bool(sell_eval.get("hit_wma_grad")):
+                main_slot.full_reset()
+            if 0 in sub_sold_indices or bool(
+                sell_eval.get("hit_sub_wma_grad")
+            ):
+                sub_slot.full_reset()
         if did_order and (triggered_by_wick_only or wick_trade_ts > 0.0):
             _LAST_CONSUMED_WICK_TRADE_TS = max(
                 _LAST_CONSUMED_WICK_TRADE_TS,

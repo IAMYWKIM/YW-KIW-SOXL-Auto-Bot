@@ -4,9 +4,14 @@ import hashlib
 
 import config
 
-CURRENT_VERSION = "1.0.6"
+CURRENT_VERSION = "1.0.7"
 
 HISTORY = [
+    ("1.0.7", "2026-11-13",
+     "원본 인피니트 스노우볼 v18.0(Case 01~100) 반영 점검: 토스 주소·연결 고리 변화 없음(키움 블록 수정 불필요). "
+     "원본 /dev/shm 공유 버스(Case 98)를 키움판 전용 폴더로 분리(config.json KIWOOM.SHM_BUS_DIR, 기본 /dev/shm/kiw_soxl_bus_v3). "
+     "engine_sync 감시 상수에 1층 트레일링(Case 99)·공유 버스 상수 추가. tests/sim_engine.py 를 1층 트레일링 익절 시나리오로 변경. "
+     "매뉴얼 1.3(1층 트레일링, 바벨 100% Top-Up·실시간 재배분, 암살자 v18, 공유 버스, 이슈 #396~#402)"),
     ("1.0.6", "2026-11-13",
      "성과보고 이메일 간편 설정: scripts/email_setup_kiw_soxl.sh (다른 키움 봇 .env 의 SMTP 계정 복사 또는 직접 입력, "
      "EMAIL_TO 지정, config.json 이메일 자동발송·일간·주간·월간·엑셀 첨부 켜기, 테스트 메일, 재시작 확인). "

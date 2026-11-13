@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -63,6 +64,7 @@ from plugin_updater import (
 )
 from quant_engine import (
     MAX_RESERVE_PORTIONS,
+    SNIPER_L1_TRAIL_ENABLED,
     SUB_FROZEN_DAYS_TRIGGER,
     SUB_MAX_TIERS_3,
     SUB_MAX_TOTAL_LOTS_4,
@@ -80,6 +82,7 @@ from quant_indicators_plugin import (
     refresh_metrics_with_live_tick,
 )
 from sniper_exit_plugin import (
+    get_sniper_l1_trail_ui_snapshot,
     is_within_post_buy_time_shield,
     is_within_post_sell_time_shield,
     is_within_sell_monitor_time_shield,
@@ -118,8 +121,41 @@ PORTION_MODE_SIMPLE: str = "SIMPLE_08PCT"
 # ---------------------------------------------------------------------------
 # [유틸리티] HTML 이스케이프 · 3단 모드 판별 · DST 배지 · 폴더 식별자 및 안전 시드 추출
 # ---------------------------------------------------------------------------
+_VALID_TG_HTML_TAG_RE = re.compile(
+    r"(</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre)>"
+    r"|<a\s+href=['\"][^'\"]+['\"]>|</a>)",
+    re.IGNORECASE,
+)
+_RAW_AMP_RE = re.compile(
+    r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)"
+)
+
+
 def escape_html(val: Any) -> str:
     return html.escape(str(val if val is not None else ""), quote=False)
+
+
+def sanitize_telegram_html(text: Any) -> str:
+    raw = str(text if text is not None else "")
+    if not raw:
+        return ""
+    parts = _VALID_TG_HTML_TAG_RE.split(raw)
+    out: List[str] = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1:
+            out.append(part)
+        else:
+            cleaned = _RAW_AMP_RE.sub("&amp;", part)
+            cleaned = cleaned.replace("<", "&lt;").replace(">", "&gt;")
+            out.append(cleaned)
+    return "".join(out)
+
+
+def strip_telegram_html(text: Any) -> str:
+    raw = str(text if text is not None else "")
+    if not raw:
+        return ""
+    return html.unescape(_VALID_TG_HTML_TAG_RE.sub("", raw))
 
 
 def _is_barbell_portion_mode(st_or_mode: Any) -> bool:
@@ -314,8 +350,8 @@ def build_start_schedule_message(
         "🔄 <b>잔고 동기화</b> : 잔고 · 예수금 · 수익금고 해부",
         "⚙️ <b>전술 제어반</b> : 전원 · 복리/단리/바벨 · 암살자승격",
         "🚀 <b>시스템 업데이트</b> : 최신 코드 무중단 동기화",
-        "⚖️ <code>/barbell</code> : 바벨(60/30/10) & 별도수익금고 상세",
-        "🗡️ <code>/assassin</code> : [모의/실전] 암살자 14대게이트 상세",
+        "⚖️ <code>/barbell</code> : 바벨(60/30/10) &amp; 별도수익금고 상세",
+        "🗡️ <code>/assassin</code> : [모의/실전] 암살자 순수 10G 상세",
     ]
     return "\n".join(lines)
 
@@ -327,6 +363,7 @@ def _format_multi_grid_stratum_lines(
     is_late_cutoff: bool = False,
     live_rsi_14: float = 50.0,
     live_assassin_active: bool = False,
+    main_trail_ui: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     held_sh = safe_int(summary.get("held_shares"), 0)
     buckets = summary.get("buckets", [])
@@ -368,13 +405,35 @@ def _format_multi_grid_stratum_lines(
         else:
             l1_qty_label = f"{b1.qty}주"
 
-        l1_ov_lock_note = (
-            "·🔒" if (is_ext_sell_only and has_upper_tiers) else ""
-        )
-        lines.append(
-            f"⚡ <b>[1층: {l1_qty_label}·${b1.actual_cost_usd:,.0f}]</b> "
-            f"<b>${b1.book_price:.2f}</b> ➔ <b>${l1_t:.2f}</b> ({g1_sign}{l1_g:.2f}%{l1_ov_lock_note})"
-        )
+        if SNIPER_L1_TRAIL_ENABLED and not is_ext_sell_only:
+            tr_m = main_trail_ui if isinstance(main_trail_ui, dict) else {}
+            l1_ign_p = safe_float(summary.get("l1_ignite_100_price"), l1_t)
+            if bool(tr_m.get("armed")):
+                st_p = safe_float(tr_m.get("active_stop_p"), l1_ign_p)
+                lk_b = (
+                    "👑1.25%락"
+                    if bool(tr_m.get("stepped_125"))
+                    else "🔥1%추적"
+                )
+                lines.append(
+                    f"⚡ <b>[1층: {l1_qty_label}·${b1.actual_cost_usd:,.0f}]</b> "
+                    f"<b>${b1.book_price:.2f}</b> ➔ 스탑 <b>${st_p:.2f}</b> ({g1_sign}{l1_g:.2f}%·{lk_b})"
+                )
+            else:
+                fg_c = safe_int(tr_m.get("forgive_count"), 0)
+                fg_b = f"·💡용서{fg_c}" if fg_c > 0 else "·점화1%"
+                lines.append(
+                    f"⚡ <b>[1층: {l1_qty_label}·${b1.actual_cost_usd:,.0f}]</b> "
+                    f"<b>${b1.book_price:.2f}</b> ➔ <b>${l1_ign_p:.2f}</b> ({g1_sign}{l1_g:.2f}%{fg_b})"
+                )
+        else:
+            l1_ov_lock_note = (
+                "·🔒" if (is_ext_sell_only and has_upper_tiers) else ""
+            )
+            lines.append(
+                f"⚡ <b>[1층: {l1_qty_label}·${b1.actual_cost_usd:,.0f}]</b> "
+                f"<b>${b1.book_price:.2f}</b> ➔ <b>${l1_t:.2f}</b> ({g1_sign}{l1_g:.2f}%{l1_ov_lock_note})"
+            )
     else:
         l2_cap = safe_float(
             summary.get("l2_ceiling_price"),
@@ -391,11 +450,11 @@ def _format_multi_grid_stratum_lines(
             )
         elif live_rsi_14 > 50.0:
             lines.append(
-                f"⚡ <b>[1층: 공석]</b> 눌림(-1%)/🛡️돌파과열차단(RSI {live_rsi_14:.1f}>50){cap_note}"
+                f"⚡ <b>[1층: 공석]</b> 눌림(-1%)/🛡️돌파과열차단(RSI {live_rsi_14:.1f}&gt;50){cap_note}"
             )
         else:
             lines.append(
-                f"⚡ <b>[1층: 공석]</b> 1분주기 눌림(-1%)/돌파(RSI<=50){cap_note}"
+                f"⚡ <b>[1층: 공석]</b> 1분주기 눌림(-1%)/돌파(RSI&lt;=50){cap_note}"
             )
 
     if upper_buckets:
@@ -452,6 +511,8 @@ def _format_sub_grid_stratum_lines(
     live_price: float,
     is_ext_sell_only: bool = False,
     is_late_cutoff: bool = False,
+    live_rsi_14: float = 50.0,
+    sub_trail_ui: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     held_sh_main = safe_int(summary.get("held_shares"), 0)
     sub_sh = safe_int(summary.get("sub_held_shares"), 0)
@@ -517,13 +578,37 @@ def _format_sub_grid_stratum_lines(
             sl1_label = f"{sb1.qty}/{sub_target_q}주"
         else:
             sl1_label = f"{sb1.qty}주"
-        sl1_ov_note = (
-            "·🔒" if (is_ext_sell_only and has_sub_uppers) else ""
-        )
-        lines.append(
-            f"  ⚡ <b>[서브1층: {sl1_label}·${sb1.actual_cost_usd:,.0f}]</b> "
-            f"<b>${sb1.book_price:.2f}</b> ➔ <b>${sl1_t:.2f}</b> ({sg1_s}{sl1_g:.2f}%{sl1_ov_note})"
-        )
+        if SNIPER_L1_TRAIL_ENABLED and not is_ext_sell_only:
+            tr_s = sub_trail_ui if isinstance(sub_trail_ui, dict) else {}
+            sl1_ign_p = safe_float(
+                summary.get("sub_l1_ignite_100_price"), sl1_t
+            )
+            if bool(tr_s.get("armed")):
+                sst_p = safe_float(tr_s.get("active_stop_p"), sl1_ign_p)
+                slk_b = (
+                    "👑1.25%락"
+                    if bool(tr_s.get("stepped_125"))
+                    else "🔥1%추적"
+                )
+                lines.append(
+                    f"  ⚡ <b>[서브1층: {sl1_label}·${sb1.actual_cost_usd:,.0f}]</b> "
+                    f"<b>${sb1.book_price:.2f}</b> ➔ 스탑 <b>${sst_p:.2f}</b> ({sg1_s}{sl1_g:.2f}%·{slk_b})"
+                )
+            else:
+                sfg_c = safe_int(tr_s.get("forgive_count"), 0)
+                sfg_b = f"·💡용서{sfg_c}" if sfg_c > 0 else "·점화1%"
+                lines.append(
+                    f"  ⚡ <b>[서브1층: {sl1_label}·${sb1.actual_cost_usd:,.0f}]</b> "
+                    f"<b>${sb1.book_price:.2f}</b> ➔ <b>${sl1_ign_p:.2f}</b> ({sg1_s}{sl1_g:.2f}%{sfg_b})"
+                )
+        else:
+            sl1_ov_note = (
+                "·🔒" if (is_ext_sell_only and has_sub_uppers) else ""
+            )
+            lines.append(
+                f"  ⚡ <b>[서브1층: {sl1_label}·${sb1.actual_cost_usd:,.0f}]</b> "
+                f"<b>${sb1.book_price:.2f}</b> ➔ <b>${sl1_t:.2f}</b> ({sg1_s}{sl1_g:.2f}%{sl1_ov_note})"
+            )
     else:
         sub_l2_cap = safe_float(
             summary.get("sub_l2_ceiling_price"),
@@ -538,9 +623,17 @@ def _format_sub_grid_stratum_lines(
             lines.append(
                 f"  ⚡ <b>[서브1층: 공석]</b> 🔒장외잠금 · 04:07 재장전{s_cap_note}"
             )
+        elif is_late_cutoff:
+            lines.append(
+                f"  ⚡ <b>[서브1층: 공석]</b> 🛡️돌파차단 · 눌림(-1%) 감시{s_cap_note}"
+            )
+        elif live_rsi_14 > 50.0:
+            lines.append(
+                f"  ⚡ <b>[서브1층: 공석]</b> 눌림(-1%)/🛡️돌파차단(RSI {live_rsi_14:.1f}&gt;50){s_cap_note}"
+            )
         else:
             lines.append(
-                f"  ⚡ <b>[서브1층: 공석]</b> 1분주기 재장전 감시{s_cap_note}"
+                f"  ⚡ <b>[서브1층: 공석]</b> 1분주기 눌림(-1%)/돌파(RSI&lt;=50){s_cap_note}"
             )
 
     if sub_upper_buckets:
@@ -617,7 +710,9 @@ def build_avwap_radar_message(
     )
     rsi_14 = safe_float(met.get("rsi_14"), 50.0)
 
-    summary = summarize_stratum_portfolio(st, live_price=lp, now_est=dt_now)
+    summary = summarize_stratum_portfolio(
+        st, live_price=lp, now_est=dt_now, rsi_14=rsi_14
+    )
     is_active = bool(st.get("is_active", True))
     is_barbell = _is_barbell_portion_mode(st)
     is_simple = _is_simple_portion_mode(st)
@@ -734,6 +829,18 @@ def build_avwap_radar_message(
             f"🎯 <b>[1층 잔량 {l1_rem_q}주 대기]</b> <b>${l1_book_p:.2f}</b> 이하 시 매수"
         )
 
+    trail_ui_snap = (
+        get_sniper_l1_trail_ui_snapshot(context, symbol=TARGET_SYMBOL)
+        if context is not None
+        else {"main": {}, "sub": {}}
+    )
+    main_tr_ui = trail_ui_snap.get("main") or {}
+    sub_tr_ui = trail_ui_snap.get("sub") or {}
+    if not shield_line and (
+        bool(main_tr_ui.get("armed")) or bool(sub_tr_ui.get("armed"))
+    ):
+        shield_line = "🔥 <b>[1층 스텝트레일링 0.4s 추적중]</b> 하드보존·완결HA·용서 가동"
+
     stratum_lines = _format_multi_grid_stratum_lines(
         summary,
         lp,
@@ -741,12 +848,15 @@ def build_avwap_radar_message(
         is_late_cutoff=is_late_cutoff,
         live_rsi_14=rsi_14,
         live_assassin_active=live_assn_active,
+        main_trail_ui=main_tr_ui,
     )
     sub_stratum_lines = _format_sub_grid_stratum_lines(
         summary,
         lp,
         is_ext_sell_only=is_ext_sell_only,
         is_late_cutoff=is_late_cutoff,
+        live_rsi_14=rsi_14,
+        sub_trail_ui=sub_tr_ui,
     )
 
     _, _, _, gate_info = evaluate_buy_gate_bucket_status(
@@ -768,7 +878,7 @@ def build_avwap_radar_message(
     if live_assn_active:
         gate_header_line = "🎯 <b>[다음 매수 타점 · 실전 암살자 위임]</b>"
         gate_cond_lines.append(
-            "▫️ 04:07 ~ 08:14 EST 14대 진성 게이트 포착 시 단발 타격"
+            "▫️ 04:07 ~ 08:14 EST 순수 10대 급락 게이트 포착 시 단발 타격"
         )
     elif held_sh <= 0:
         gate_header_line = "🎯 <b>[다음 매수 타점 · 0주 첫 진입]</b>"
@@ -792,9 +902,9 @@ def build_avwap_radar_message(
         if is_late_cutoff:
             brk_str = "돌파차단(15:30~)"
         elif rsi_14 > 50.0:
-            brk_str = f"돌파차단(RSI {rsi_14:.1f}>50)"
+            brk_str = f"돌파차단(RSI {rsi_14:.1f}&gt;50)"
         else:
-            brk_str = f"돌파 <b>${brk_p:.2f}</b>(RSI<=50)"
+            brk_str = f"돌파 <b>${brk_p:.2f}</b>(RSI&lt;=50)"
         cap_str = f" · 상한 ${l2_cap_p:.2f}" if l2_cap_p > 0.0 else ""
         gate_cond_lines.append(
             f"▫️ 눌림 <b>${pull_p:.2f}</b> / {brk_str} 시 {quota_badge_str} 매수"
@@ -915,8 +1025,11 @@ def build_avwap_radar_message(
         ]
     )
     if used_res_cnt > 0:
+        repay_timing_lbl = (
+            "지층익절 즉시환수" if is_barbell else "졸업시 원복"
+        )
         lines.append(
-            f"💉 자동수혈: <b>{used_res_cnt}회분</b> 사용 (${inj_res_usd:,.2f} · 졸업시 원복)"
+            f"💉 자동수혈: <b>{used_res_cnt}회분</b> 사용 (${inj_res_usd:,.2f} · {repay_timing_lbl})"
         )
     lines.extend(
         [
@@ -1261,19 +1374,26 @@ def build_settlement_control_message(
 # [핵심 2] 텔레그램 명령어 및 콜백 비동기 컨트롤러 (TelegramCommandController)
 # ---------------------------------------------------------------------------
 class TelegramCommandController:
-    def __init__(self, context: Any) -> None:
+    def __init__(
+        self,
+        context: Any,
+        bot_token: Optional[str] = None,
+        chat_id: Optional[str] = None,
+    ) -> None:
         self.context: Any = context
         self.base_dir: str = get_bot_base_dir(
             getattr(context, "base_dir", None)
         )
-        self.bot_token: str = (
-            os.environ.get("TELEGRAM_BOT_TOKEN")
+        self.bot_token: str = str(
+            bot_token
+            or os.environ.get("TELEGRAM_BOT_TOKEN")
             or os.environ.get("TG_BOT_TOKEN")
             or os.environ.get("BOT_TOKEN")
             or ""
         ).strip()
         self.chat_id: str = str(
-            os.environ.get("TELEGRAM_CHAT_ID")
+            chat_id
+            or os.environ.get("TELEGRAM_CHAT_ID")
             or os.environ.get("TG_CHAT_ID")
             or os.environ.get("CHAT_ID")
             or ""
@@ -1483,18 +1603,24 @@ class TelegramCommandController:
         target_chat = str(chat_id or self.chat_id or "").strip()
         if not self.bot_token or not target_chat:
             return False
+        is_html = str(parse_mode or "").upper().strip() == "HTML"
+        clean_text = (
+            sanitize_telegram_html(text) if is_html else str(text or "")
+        )
         payload: Dict[str, Any] = {
             "chat_id": target_chat,
-            "text": text,
-            "parse_mode": parse_mode,
+            "text": clean_text,
             "disable_web_page_preview": True,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
 
         res = await self._call_tg("sendMessage", payload, timeout_sec=10.0)
         if not bool(res.get("ok")):
             payload.pop("parse_mode", None)
+            payload["text"] = strip_telegram_html(clean_text)
             res = await self._call_tg("sendMessage", payload, timeout_sec=10.0)
         return bool(res.get("ok"))
 
@@ -1505,11 +1631,12 @@ class TelegramCommandController:
         text: str,
         reply_markup: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        clean_text = sanitize_telegram_html(text)
         if message_id is not None and message_id > 0:
             payload: Dict[str, Any] = {
                 "chat_id": str(chat_id),
                 "message_id": int(message_id),
-                "text": text,
+                "text": clean_text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
@@ -1523,7 +1650,7 @@ class TelegramCommandController:
             ):
                 return True
         return await self.send_message(
-            text=text, chat_id=chat_id, reply_markup=reply_markup
+            text=clean_text, chat_id=chat_id, reply_markup=reply_markup
         )
 
     async def send_slim_alert(
@@ -1583,17 +1710,23 @@ class TelegramCommandController:
         base_met = self.context.candle_metrics_cache.get(TARGET_SYMBOL, {})
         if (
             not isinstance(base_met, dict)
+            or not bool(base_met.get("anchors_ready", False))
             or safe_float(base_met.get("prev_bar_close"), 0.0) <= 0.0
         ):
             try:
                 c_1m = await self.context.api.get_candles_1m(
-                    symbol=TARGET_SYMBOL, total_count=200
+                    symbol=TARGET_SYMBOL, total_count=400
                 )
-                if c_1m:
-                    base_met = compute_soxl_quant_metrics_1m(
-                        candles=c_1m,
-                        live_price=live_p,
-                        now_est=now_est,
+                c_1d = await self.context.api.get_candles_1d(
+                    symbol=TARGET_SYMBOL, count=10
+                )
+                if c_1m or c_1d:
+                    base_met = await asyncio.to_thread(
+                        compute_soxl_quant_metrics_1m,
+                        c_1m or [],
+                        live_p,
+                        now_est,
+                        c_1d or [],
                     )
             except Exception:
                 pass
@@ -1777,10 +1910,15 @@ class TelegramCommandController:
             TARGET_SYMBOL, portion_mode=next_m
         )
 
-        # 바벨 모드로 진입한 즉시 현재 보유 SOXL 원금(<=60% / 60~100% / >=100%)을 자동 분류 동기화!
+        # 바벨 모드 진입 시 동기화 (단, 실전 암살자 단독 가동 중에는 복귀 첫 틱까지 유예)
         if is_barbell_mode(next_m):
-            await initialize_or_sync_barbell_on_mode_enter(self.context)
-            updated_st = self.context.ledger.get_state(TARGET_SYMBOL)
+            if is_live_assassin_standalone_active(self.context):
+                await ensure_barbell_ledger(self.context).update_state(
+                    is_initialized=False
+                )
+            else:
+                await initialize_or_sync_barbell_on_mode_enter(self.context)
+                updated_st = self.context.ledger.get_state(TARGET_SYMBOL)
 
         self.context.wakeup_event.set()
         if edit_msg_id is not None and edit_msg_id > 0:
@@ -1891,14 +2029,23 @@ class TelegramCommandController:
             pass
 
         try:
-            if _is_barbell_portion_mode(updated_st):
+            if _is_barbell_portion_mode(
+                updated_st
+            ) and not is_live_assassin_standalone_active(self.context):
                 await initialize_or_sync_barbell_on_mode_enter(
                     self.context, new_seed_usd=round(val, 4)
                 )
                 updated_st = self.context.ledger.get_state(TARGET_SYMBOL)
             else:
-                await ensure_barbell_ledger(self.context).update_state(
-                    initial_seed_usd=round(val, 4)
+                b_led = ensure_barbell_ledger(self.context)
+                keep_init = (
+                    False
+                    if is_live_assassin_standalone_active(self.context)
+                    else bool(b_led.get_state().get("is_initialized", False))
+                )
+                await b_led.update_state(
+                    initial_seed_usd=round(val, 4),
+                    is_initialized=keep_init,
                 )
         except Exception:
             pass
@@ -2047,7 +2194,7 @@ class TelegramCommandController:
         await self.send_message(
             chat_id=chat_id,
             text=(
-                "🧹 <b>[스나이퍼 & 바벨 수익금고 0점 초기화 완료]</b>\n"
+                "🧹 <b>[스나이퍼 &amp; 바벨 수익금고 0점 초기화 완료]</b>\n"
                 "▫️ 이번사이클 / 누적 실현익 / 별도금고: <b>$0.00</b>\n"
                 f"▫️ 복귀 기준시드: <b>${init_seed:,.2f}</b>\n"
                 f"▫️ 현재 가용현금: <b>${free_cash:,.2f}</b>\n"
