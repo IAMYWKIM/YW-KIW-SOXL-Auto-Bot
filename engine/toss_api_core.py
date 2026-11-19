@@ -24,7 +24,7 @@ import shutil
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -188,6 +188,36 @@ def next_cycled_portion_mode(cur_mode: Any) -> str:
     if is_simple_income_mode(cur_mode):
         return PORTION_MODE_BARBELL
     return PORTION_MODE_SIMPLE
+
+
+def resolve_trading_session_date_est(
+    now_est: Optional[datetime] = None,
+    after_1600_close: bool = False,
+    last_closing_report_date: str = "",
+) -> str:
+    """
+    24시간 통합 거래일(16:01 EST 애프터·데이장 ~ 익일 16:00 EST 정규장 마감) 산출기:
+    - 평일 16:00 EST 마감 결산 완료 직후(또는 17:00 EST 이후)부터 차기 미국 평일(금요일은 월요일)로 귀속한다.
+    """
+    dt = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    wd = dt.weekday()
+    if wd == 5:
+        return (dt + timedelta(days=2)).strftime("%Y-%m-%d")
+    if wd == 6:
+        return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    today_s = dt.strftime("%Y-%m-%d")
+    hm = dt.hour * 100 + dt.minute
+    closed_today = bool(
+        after_1600_close
+        or (
+            last_closing_report_date
+            and str(last_closing_report_date).strip() == today_s
+        )
+    )
+    if hm >= 1700 or (hm >= 1600 and closed_today):
+        add_days = 3 if wd == 4 else 1
+        return (dt + timedelta(days=add_days)).strftime("%Y-%m-%d")
+    return today_s
 
 
 def _read_env_us_commission_rates() -> Tuple[float, float]:
@@ -617,7 +647,9 @@ class SoxlStratumLedger:
         folder_slug: str = "default_bot",
         initial_seed: float = DEFAULT_INITIAL_SEED_USD,
     ) -> Dict[str, Any]:
-        today_est = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        now_dt_est = datetime.now(EST_TZ)
+        today_est = now_dt_est.strftime("%Y-%m-%d")
+        sess_est = resolve_trading_session_date_est(now_dt_est)
         clean_seed = (
             round(initial_seed, 4)
             if initial_seed >= 100.0
@@ -636,6 +668,7 @@ class SoxlStratumLedger:
             # [Case 91 + 바벨 확장]: COMP_08PCT / SIMPLE_08PCT / BARBELL_60_30_10 및 격리 수익금 오프셋
             "portion_mode": PORTION_MODE_COMPOUND,
             "vaulted_profit_locked_usd": 0.0,
+            "cycle_vaulted_locked_usd": 0.0,
             "threshold_mode": "WIDE_RUNWAY",
             "reentry_mode": "HYBRID_PULL_OR_BRK",
             "grid_merge_mode": DEFAULT_GRID_MERGE_MODE,
@@ -721,7 +754,7 @@ class SoxlStratumLedger:
             "last_reserve_check_ts": 0.0,
             "last_evaluated_buy_bucket_id": -1,
             "last_evaluated_date": today_est,
-            "logical_date": today_est,
+            "logical_date": sess_est,
             "last_closing_report_date": "",
             "last_tg_update_id": 0,
             "total_buy_events": 0,
@@ -791,7 +824,19 @@ class SoxlStratumLedger:
             l1_list = []
             uppers = list(clean_buckets[:])
 
-        max_upper_cnt = MAX_GRID_TIERS_7 - 1
+        # MODIFIED: 2층 개별 익절 후 [2층 공석] (GRID_L3~L7 시작) 슬롯 보존
+        first_up_tag = (
+            str(uppers[0].get("lot_type") or "").upper().strip()
+            if uppers
+            else ""
+        )
+        start_tier_no = (
+            3
+            if first_up_tag
+            in ("GRID_L3", "GRID_L4", "GRID_L5", "GRID_L6", "GRID_L7")
+            else 2
+        )
+        max_upper_cnt = max(1, MAX_GRID_TIERS_7 - (start_tier_no - 1))
         m_mode = str(merge_mode or DEFAULT_GRID_MERGE_MODE).upper().strip()
 
         while len(uppers) > max_upper_cnt:
@@ -862,7 +907,7 @@ class SoxlStratumLedger:
 
         relabeled_uppers: List[Dict[str, Any]] = []
         for idx, b in enumerate(uppers):
-            tier_no = min(MAX_GRID_TIERS_7, idx + 2)
+            tier_no = min(MAX_GRID_TIERS_7, idx + start_tier_no)
             b_copy = dict(b)
             b_copy["lot_type"] = f"GRID_L{tier_no}"
             relabeled_uppers.append(b_copy)
@@ -1463,6 +1508,7 @@ class SoxlStratumLedger:
             st["cycle_sub_realized_net_usd"] = 0.0
             st["cycle_sell_events"] = 0
             st["cycle_leftover_saved_usd"] = 0.0
+            st["cycle_vaulted_locked_usd"] = 0.0
         else:
             st["cycle_realized_gross_usd"] = round(
                 safe_float(st.get("cycle_realized_gross_usd"), 0.0), 4
@@ -1482,6 +1528,16 @@ class SoxlStratumLedger:
             st["cycle_leftover_saved_usd"] = round(
                 safe_float(st.get("cycle_leftover_saved_usd"), 0.0), 4
             )
+            st["cycle_vaulted_locked_usd"] = round(
+                min(
+                    st["vaulted_profit_locked_usd"],
+                    max(
+                        0.0,
+                        safe_float(st.get("cycle_vaulted_locked_usd"), 0.0),
+                    ),
+                ),
+                4,
+            )
 
         # 🚨 [Case 77, Case 88, Case 91 & 바벨 모드(60% SOXL 분리 · 별도 수익금고 격리) 통합 회계 항등식 강제]
         actual_inv_buckets = round(
@@ -1500,8 +1556,11 @@ class SoxlStratumLedger:
 
         if is_barbell_mode(st["portion_mode"]):
             soxl_core_60 = round(init_seed * BARBELL_SOXL_WEIGHT, 4)
+            # MODIFIED [Case 94]: 선행 익절 격리분 차감 결손 보전으로 유령현금 0% 항등식 유지
             cyc_loss_adj = min(
-                0.0, safe_float(st.get("cycle_realized_net_usd"), 0.0)
+                0.0,
+                safe_float(st.get("cycle_realized_net_usd"), 0.0)
+                - safe_float(st.get("cycle_vaulted_locked_usd"), 0.0),
             )
             total_pool_equity = (
                 max(0.0, soxl_core_60 + cyc_loss_adj) + inj_res_usd
@@ -1984,6 +2043,7 @@ class SoxlStratumLedger:
             initial_seed_usd=round(init_seed, 4),
             cumulative_realized_net_usd=round(cum_net, 4),
             vaulted_profit_locked_usd=round(v_locked, 4),
+            cycle_vaulted_locked_usd=0.0,
             cycle_realized_gross_usd=0.0,
             cycle_realized_fee_usd=0.0,
             cycle_realized_net_usd=0.0,
@@ -2047,6 +2107,7 @@ class SoxlStratumLedger:
             kw["cumulative_realized_gross_usd"] = 0.0
             kw["cumulative_realized_fee_usd"] = 0.0
             kw["vaulted_profit_locked_usd"] = 0.0
+            kw["cycle_vaulted_locked_usd"] = 0.0
             kw["cycle_realized_gross_usd"] = 0.0
             kw["cycle_realized_fee_usd"] = 0.0
             kw["cycle_realized_net_usd"] = 0.0
@@ -2096,38 +2157,41 @@ class SoxlStratumLedger:
         self, logical_date: str
     ) -> Dict[str, Any]:
         st = self.get_state(TARGET_SYMBOL)
-        cur_date = str(st.get("logical_date") or "")
-        if cur_date == str(logical_date):
+        target_d = str(logical_date or "").strip()
+        cur_date = str(st.get("logical_date") or "").strip()
+        if not target_d or (cur_date and cur_date >= target_d):
             return st
-        return await self.update_state(
-            TARGET_SYMBOL,
-            logical_date=str(logical_date),
-            daily_buy_events=0,
-            daily_unlock_buy_events=0,
-            daily_sub_buy_cnt=0,
-            daily_sub_buy_events=0,
-            daily_sub_sell_cnt=0,
-            daily_sub_sell_events=0,
-            daily_sub_unlock_events=0,
-            daily_sub_realized_net_usd=0.0,
-            daily_main_buy_cnt=0,
-            daily_main_sell_cnt=0,
-            daily_reserve_injected_cnt=0,
-            daily_dust_guard_blocked_cnt=0,
-            daily_sell_events=0,
-            daily_indiv_grid_sell_cnt=0,
-            daily_wma_grad_sell_cnt=0,
-            daily_seed_protect_pass_cnt=0,
-            daily_reanchor_cnt=0,
-            daily_leftover_saved_usd=0.0,
-            daily_realized_net_usd=0.0,
-            last_evaluated_buy_bucket_id=-1,
-            last_evaluated_date=str(logical_date),
-            sub_last_evaluated_buy_bucket_id=-1,
-            sub_last_evaluated_date=str(logical_date),
-            last_reentry_eval_ts=0.0,
-            last_sub_reentry_eval_ts=0.0,
-        )
+        cal_today = datetime.now(EST_TZ).strftime("%Y-%m-%d")
+        upd_kw: Dict[str, Any] = {
+            "logical_date": target_d,
+            "daily_buy_events": 0,
+            "daily_unlock_buy_events": 0,
+            "daily_sub_buy_cnt": 0,
+            "daily_sub_buy_events": 0,
+            "daily_sub_sell_cnt": 0,
+            "daily_sub_sell_events": 0,
+            "daily_sub_unlock_events": 0,
+            "daily_sub_realized_net_usd": 0.0,
+            "daily_main_buy_cnt": 0,
+            "daily_main_sell_cnt": 0,
+            "daily_reserve_injected_cnt": 0,
+            "daily_dust_guard_blocked_cnt": 0,
+            "daily_sell_events": 0,
+            "daily_indiv_grid_sell_cnt": 0,
+            "daily_wma_grad_sell_cnt": 0,
+            "daily_seed_protect_pass_cnt": 0,
+            "daily_reanchor_cnt": 0,
+            "daily_leftover_saved_usd": 0.0,
+            "daily_realized_net_usd": 0.0,
+            "last_reentry_eval_ts": 0.0,
+            "last_sub_reentry_eval_ts": 0.0,
+        }
+        if cal_today >= target_d:
+            upd_kw["last_evaluated_buy_bucket_id"] = -1
+            upd_kw["last_evaluated_date"] = cal_today
+            upd_kw["sub_last_evaluated_buy_bucket_id"] = -1
+            upd_kw["sub_last_evaluated_date"] = cal_today
+        return await self.update_state(TARGET_SYMBOL, **upd_kw)
 
 
 # 하위 호환 별칭 (타 모듈 임포트 호환 100% 보장)

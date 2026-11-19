@@ -4,8 +4,8 @@
 
 원본 엔진 + 키움 브릿지 + 기록/보고 모듈을 '가짜 키움 서버'에 붙여 실제로 돌려 봅니다.
   - 봇 폴더를 임시 폴더로 복사해서 돌리므로 서버의 원장·기록·설정은 건드리지 않습니다.
-  - 시계를 미국 동부 평일 10:00 로 옮기고, SOXL 가격을 $30.00 → (75초) $30.45 → (90초) $30.55 → (110초~) $30.40 으로 움직입니다.
-  - 기대 결과: 1층 매수(REENTRY_1FL) → 60초 타임쉴드 → +1% 점화·트레일링 콜백 익절(Case 99) → 0주 졸업(CYCLE_DONE),
+  - 시계를 미국 동부 평일 10:00 로 옮기고, SOXL 가격을 $30.00 → (75초) $30.50 → (90초) $30.56 → (110초~) $30.50 으로 움직입니다.
+  - 기대 결과: 1층 매수(REENTRY_1FL) → 60초 타임쉴드 → +1.5% 점화·+1.6% 보존선 이탈 익절(Case 99·103) → 0주 졸업(CYCLE_DONE),
               기동 직후 🔫 레이더 화면 1회 발송, 오류(Traceback) 0건.
 
   사용법:  kiw_soxl_venv/bin/python3 tests/sim_engine.py            # 약 2분 30초
@@ -30,7 +30,7 @@ sys.path.insert(0, PROJ)
 sys.path.insert(1, os.path.join(PROJ, "tests"))
 os.chdir(PROJ)
 PORT = int(os.environ.get("SIM_PORT", "18199"))
-RUN_SEC = float(os.environ.get("SIM_SEC", "160"))
+RUN_SEC = float(os.environ.get("SIM_SEC", "180"))
 os.environ.update(TRADE_MODE="MOCK", KIWOOM_APP_KEY_MOCK="k", KIWOOM_SECRET_KEY_MOCK="s", DRY_RUN="false",
                   KIWOOM_MOCK_API_BASE=f"http://127.0.0.1:{PORT}", TELEGRAM_ENABLED="true",
                   TELEGRAM_BOT_TOKEN="123:SIM", TELEGRAM_CHAT_ID="1", LOG_LEVEL="WARNING")
@@ -55,10 +55,10 @@ import fake_kiwoom  # noqa: E402
 config.ensure_config_json()
 fake_kiwoom.serve(PORT)
 T0 = time.time()
-# v18(Case 99) 1층 트레일링: +1.0% 점화 → 고점 +1.83% → 고점 대비 -0.49% 콜백(+1.33%, 보존선 +1.25% 위) 에서 매도
+# v21(Case 99·103) 1층 트레일링: +1.50% 무스탑 점화 → 고점 +1.87%(+1.75% 돌파, 보존선 +1.60% 잠금) → +1.57% 로 보존선 이탈 → 매도
 def _script(t):
     d = t - T0
-    return 30.00 if d < 75 else 30.45 if d < 90 else 30.55 if d < 110 else 30.40
+    return 30.00 if d < 75 else 30.50 if d < 90 else 30.56 if d < 110 else 30.47 if d < 125 else 30.49
 fake_kiwoom.MKT.script = _script
 
 import engine_hooks  # noqa: E402

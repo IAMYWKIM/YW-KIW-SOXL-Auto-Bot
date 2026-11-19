@@ -107,22 +107,28 @@ SUB_UNLOCK_DROP_FROM_L1_PCT: float = float(
     getattr(toss_api, "SUB_UNLOCK_DROP_FROM_L1_PCT", 10.0)
 )
 
-# 🎯 4 & Case 59, Case 71, Case 72, Case 73, Case 84, Case 88, Case 92: 상단 그리드 보유 중 1층 공석 시 60초 주기 눌림목/상승돌파 임계치(%) 및 돌파 RSI 상한(50.0)
+# 🎯 4 & Case 59, Case 71, Case 72, Case 73, Case 84, Case 88, Case 92, Case 105: 1층 공석 눌림(세션VWAP+7분쉴드)/돌파(RSI<=50)/최저가돌파 상수
 REENTRY_PULLBACK_DROP_PCT: float = -1.00
 REENTRY_BREAKOUT_RISE_PCT: float = 1.00
 REENTRY_BREAKOUT_MAX_RSI_50: float = float(
     getattr(toss_api, "REENTRY_BREAKOUT_MAX_RSI_50", 50.0)
 )
+REG_OPEN_VWAP_SHIELD_START_HM: int = 930
+REG_OPEN_VWAP_SHIELD_END_HM: int = 936
 
-# NEW [Case 99 : 🛡️ 스나이퍼 1층 스텝 락온 트레일링(1.00% ➔ 1.45%시 1.25% 하드보존) + 완결 1분봉 HA 음봉 + <1% 용서·망각 상수]
+# MODIFIED [제안 B 확정 : 본 1층 & 서브 1층 공격수 +1.50% 무스탑 점화 ➔ +1.75% 돌파 시 +1.60% 잠금 상향 통일]
 SNIPER_L1_TRAIL_ENABLED: bool = True
-SNIPER_L1_TRAIL_IGNITE_PCT: float = 1.00
-SNIPER_L1_TRAIL_STEP_TRIG_PCT: float = 1.45
-SNIPER_L1_TRAIL_STEP_LOCK_PCT: float = 1.25
+SNIPER_L1_TRAIL_IGNITE_PCT: float = 1.50
+SNIPER_L1_TRAIL_STEP_TRIG_PCT: float = 1.75
+SNIPER_L1_TRAIL_STEP_LOCK_PCT: float = 1.60
+SUB_SNIPER_L1_TRAIL_IGNITE_PCT: float = 1.50
+SUB_SNIPER_L1_TRAIL_STEP_TRIG_PCT: float = 1.75
+SUB_SNIPER_L1_TRAIL_STEP_LOCK_PCT: float = 1.60
+# MODIFIED [Case 106]: 실시간 -0.35% 틱 콜백 영구 폐기(0.00) ➔ 하드보존(+1.60%) + 순수 완결 1분봉 강세HA 홀딩 단일화
 SNIPER_L1_TRAIL_SAFE_CAP_PCT: float = 5.00
 SNIPER_L1_TRAIL_BOOST_TIER2_PCT: float = 2.00
-SNIPER_L1_TRAIL_CB_TIGHT_PCT: float = 0.20
-SNIPER_L1_TRAIL_CB_WIDE_PCT: float = 0.30
+SNIPER_L1_TRAIL_CB_TIGHT_PCT: float = 0.00
+SNIPER_L1_TRAIL_CB_WIDE_PCT: float = 0.00
 SNIPER_L1_TRAIL_QQQ_BYPASS_PCT: float = 0.20
 
 # [Case 84 & Case 88]: 정규장 마감 30분 전(15:30 ~ 16:00 EST) 본·서브 0주 새 사이클 첫 1층 진입 및 1층 공석 +1.0% 돌파 추격 동시 차단 기준 시각(HHMM)
@@ -403,10 +409,37 @@ def has_active_l1_bucket(buckets: Sequence[StratumBucket]) -> bool:
     return not is_upper_grid_tier(valid[0])
 
 
+def is_vacant_l2_upper_slice(upper_buckets: Sequence[StratumBucket]) -> bool:
+    # NEW: 상단 버킷 슬라이스의 최전방이 GRID_L3~L7 이면 [2층 공석] 상태로 판별
+    valid = [
+        b
+        for b in (upper_buckets or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
+    if not valid:
+        return False
+    tag = str(valid[0].lot_type or "").upper().strip()
+    return tag in ("GRID_L3", "GRID_L4", "GRID_L5", "GRID_L6", "GRID_L7")
+
+
+def has_active_l2_bucket(buckets: Sequence[StratumBucket]) -> bool:
+    # NEW: 본 그리드에 활성 2층(GRID_L2) 보조공격수가 존재하는지 판별
+    valid = [
+        b
+        for b in (buckets or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
+    uppers = valid[1:] if has_active_l1_bucket(valid) else valid[:]
+    if not uppers:
+        return False
+    return not is_vacant_l2_upper_slice(uppers)
+
+
 def relabel_upper_grid_tiers(
     upper_buckets: Sequence[StratumBucket],
     max_tiers: int = MAX_GRID_TIERS_7,
     merge_mode: str = DEFAULT_GRID_MERGE_MODE,
+    preserve_vacant_l2: Optional[bool] = None,
 ) -> List[StratumBucket]:
     valid = [
         b
@@ -416,7 +449,14 @@ def relabel_upper_grid_tiers(
     if not valid:
         return []
 
-    max_upper_cnt = max(1, safe_int(max_tiers, MAX_GRID_TIERS_7) - 1)
+    eff_max_t = max(2, safe_int(max_tiers, MAX_GRID_TIERS_7))
+    if preserve_vacant_l2 is None:
+        vacant_l2 = is_vacant_l2_upper_slice(valid) and eff_max_t >= 3
+    else:
+        vacant_l2 = bool(preserve_vacant_l2) and eff_max_t >= 3
+
+    start_tier_no = 3 if vacant_l2 else 2
+    max_upper_cnt = max(1, eff_max_t - (start_tier_no - 1))
     m_mode = str(merge_mode or DEFAULT_GRID_MERGE_MODE).upper().strip()
 
     while len(valid) > max_upper_cnt:
@@ -441,7 +481,7 @@ def relabel_upper_grid_tiers(
                 book_invested_usd=m_cost,
                 actual_cost_usd=m_cost,
                 lot_count=m_lots,
-                lot_type=f"GRID_L{max_upper_cnt + 1}",
+                lot_type=f"GRID_L{eff_max_t}",
             )
             valid = kept_lowest_upper + middle_rest + [merged_bucket]
             valid.sort(key=lambda b: round(b.book_price, 4))
@@ -463,13 +503,13 @@ def relabel_upper_grid_tiers(
                 book_invested_usd=tot_cost,
                 actual_cost_usd=tot_cost,
                 lot_count=tot_lots,
-                lot_type=f"GRID_L{max_upper_cnt + 1}",
+                lot_type=f"GRID_L{eff_max_t}",
             )
             valid = kept + [merged_top]
 
     out: List[StratumBucket] = []
     for idx, b in enumerate(valid):
-        tier_no = min(max_upper_cnt + 1, idx + 2)
+        tier_no = min(eff_max_t, idx + start_tier_no)
         pure_cost = round(max(0.01 * float(b.qty), b.actual_cost_usd), 4)
         pure_p = round(max(0.01, pure_cost / float(b.qty)), 4)
         out.append(
@@ -1076,7 +1116,16 @@ def evaluate_l2_only_hybrid_reentry_signal(
     is_late_cutoff: Optional[bool] = None,
     rsi_14: Optional[float] = None,
     breakout_max_rsi: float = REENTRY_BREAKOUT_MAX_RSI_50,
+    closed_ha_shaved_bear: Optional[bool] = None,
+    closed_ha_bull: Optional[bool] = None,
+    closed_ha_ready: bool = True,
+    session_vwap: Optional[float] = None,
+    hm: Optional[int] = None,
+    cycle_min_buy_price: Optional[float] = None,
 ) -> Dict[str, Any]:
+    # MODIFIED [Case 101 & Case 105]:
+    # 1) 최저가 돌파매수(LOW_BREAK_RELOAD): 지정가 < 기억저가 도달 시 무머리 1분봉 HA음봉만 패스 후 즉시 매수
+    # 2) -1.00% 눌림목(PULLBACK_RELOAD): 09:30 ~ 09:36(7분) 타임쉴드 + 무머리 1분봉 HA음봉 패스 + 현재가 > 세션VWAP 패스
     lp = safe_float(live_price, 0.0)
     anc = safe_float(anchor_price, 0.0)
     b2_p = safe_float(l2_book_price, 0.0)
@@ -1101,6 +1150,40 @@ def evaluate_l2_only_hybrid_reentry_signal(
     )
     is_breakout_rsi_blocked = bool(
         has_rsi_filter and eff_rsi_val > (max_rsi_cap + 1e-6)
+    )
+    has_pullback_ha_filter = closed_ha_shaved_bear is not None
+    eff_shaved_bear = (
+        bool(closed_ha_shaved_bear) if has_pullback_ha_filter else False
+    )
+    eff_closed_ha_bull = (
+        bool(closed_ha_bull)
+        if closed_ha_bull is not None
+        else (not eff_shaved_bear)
+    )
+    is_pullback_ha_blocked = bool(
+        has_pullback_ha_filter
+        and ((not bool(closed_ha_ready)) or eff_shaved_bear)
+    )
+
+    sess_vwap_val = (
+        round(max(0.0, safe_float(session_vwap, 0.0)), 4)
+        if session_vwap is not None
+        else 0.0
+    )
+    hm_int = safe_int(hm, -1) if hm is not None else -1
+    is_reg_open_7m_shield = bool(
+        hm is not None
+        and REG_OPEN_VWAP_SHIELD_START_HM
+        <= hm_int
+        <= REG_OPEN_VWAP_SHIELD_END_HM
+    )
+    is_pullback_vwap_blocked = bool(
+        sess_vwap_val > 0.0 and lp > (sess_vwap_val + 1e-6)
+    )
+    c_min_p = (
+        round(max(0.0, safe_float(cycle_min_buy_price, 0.0)), 4)
+        if cycle_min_buy_price is not None
+        else 0.0
     )
 
     ref_anchor = (
@@ -1133,6 +1216,14 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "rsi_14": eff_rsi_val,
             "breakout_max_rsi": round(max_rsi_cap, 2),
             "breakout_rsi_blocked": is_breakout_rsi_blocked,
+            "pullback_ha_blocked": is_pullback_ha_blocked,
+            "pullback_vwap_blocked": is_pullback_vwap_blocked,
+            "reg_open_7m_shield_blocked": is_reg_open_7m_shield,
+            "session_vwap": sess_vwap_val,
+            "cycle_min_buy_price": c_min_p,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_closed_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
         }
 
     chg_from_exit_pct = ((lp - ref_anchor) / ref_anchor) * 100.0
@@ -1150,9 +1241,131 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "rsi_14": eff_rsi_val,
             "breakout_max_rsi": round(max_rsi_cap, 2),
             "breakout_rsi_blocked": is_breakout_rsi_blocked,
+            "pullback_ha_blocked": is_pullback_ha_blocked,
+            "pullback_vwap_blocked": is_pullback_vwap_blocked,
+            "reg_open_7m_shield_blocked": is_reg_open_7m_shield,
+            "session_vwap": sess_vwap_val,
+            "cycle_min_buy_price": c_min_p,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_closed_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
         }
 
+    # [Case 105 신규 경로 1 : 최저가 돌파매수 (LOW_BREAK_RELOAD · 지정가 < 기억저가 & 무머리 HA음봉 패스)]
+    exec_lp = max(0.01, math.floor((lp + 1e-9) * 100.0) / 100.0)
+    if c_min_p > 0.0 and exec_lp < (c_min_p - 1e-6):
+        if is_pullback_ha_blocked:
+            return {
+                "should_buy": False,
+                "signal_type": "HOLD_LOW_BREAK_SHAVED_HA_BEAR",
+                "ref_anchor": round(ref_anchor, 4),
+                "quota_ref_price": c_min_p,
+                "chg_from_exit_pct": round(chg_from_exit_pct, 2),
+                "pullback_target_price": pullback_target_p,
+                "breakout_target_price": breakout_target_p,
+                "l2_ceiling_price": round(ceil_p, 4),
+                "rsi_14": eff_rsi_val,
+                "breakout_max_rsi": round(max_rsi_cap, 2),
+                "breakout_rsi_blocked": False,
+                "pullback_ha_blocked": True,
+                "pullback_vwap_blocked": False,
+                "reg_open_7m_shield_blocked": False,
+                "session_vwap": sess_vwap_val,
+                "cycle_min_buy_price": c_min_p,
+                "closed_ha_shaved_bear": eff_shaved_bear,
+                "closed_ha_bull": eff_closed_ha_bull,
+                "closed_ha_ready": bool(closed_ha_ready),
+            }
+        return {
+            "should_buy": True,
+            "signal_type": "LOW_BREAK_RELOAD",
+            "ref_anchor": round(ref_anchor, 4),
+            "quota_ref_price": c_min_p,
+            "chg_from_exit_pct": round(chg_from_exit_pct, 2),
+            "pullback_target_price": pullback_target_p,
+            "breakout_target_price": breakout_target_p,
+            "l2_ceiling_price": round(ceil_p, 4),
+            "rsi_14": eff_rsi_val,
+            "breakout_max_rsi": round(max_rsi_cap, 2),
+            "breakout_rsi_blocked": False,
+            "pullback_ha_blocked": False,
+            "pullback_vwap_blocked": False,
+            "reg_open_7m_shield_blocked": False,
+            "session_vwap": sess_vwap_val,
+            "cycle_min_buy_price": c_min_p,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_closed_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
+        }
+
+    # [Case 101 & Case 105 경로 2 : -1.00% 눌림목 재장전 (7분쉴드 + 무머리HA음봉 패스 + 현재가 > 세션VWAP 패스)]
     if chg_from_exit_pct <= REENTRY_PULLBACK_DROP_PCT:
+        if is_reg_open_7m_shield:
+            return {
+                "should_buy": False,
+                "signal_type": "HOLD_REG_OPEN_7M_VWAP_SHIELD",
+                "ref_anchor": round(ref_anchor, 4),
+                "quota_ref_price": round(ref_anchor, 4),
+                "chg_from_exit_pct": round(chg_from_exit_pct, 2),
+                "pullback_target_price": pullback_target_p,
+                "breakout_target_price": breakout_target_p,
+                "l2_ceiling_price": round(ceil_p, 4),
+                "rsi_14": eff_rsi_val,
+                "breakout_max_rsi": round(max_rsi_cap, 2),
+                "breakout_rsi_blocked": False,
+                "pullback_ha_blocked": is_pullback_ha_blocked,
+                "pullback_vwap_blocked": is_pullback_vwap_blocked,
+                "reg_open_7m_shield_blocked": True,
+                "session_vwap": sess_vwap_val,
+                "cycle_min_buy_price": c_min_p,
+                "closed_ha_shaved_bear": eff_shaved_bear,
+                "closed_ha_bull": eff_closed_ha_bull,
+                "closed_ha_ready": bool(closed_ha_ready),
+            }
+        if is_pullback_ha_blocked:
+            return {
+                "should_buy": False,
+                "signal_type": "HOLD_PULLBACK_SHAVED_HA_BEAR",
+                "ref_anchor": round(ref_anchor, 4),
+                "quota_ref_price": round(ref_anchor, 4),
+                "chg_from_exit_pct": round(chg_from_exit_pct, 2),
+                "pullback_target_price": pullback_target_p,
+                "breakout_target_price": breakout_target_p,
+                "l2_ceiling_price": round(ceil_p, 4),
+                "rsi_14": eff_rsi_val,
+                "breakout_max_rsi": round(max_rsi_cap, 2),
+                "breakout_rsi_blocked": False,
+                "pullback_ha_blocked": True,
+                "pullback_vwap_blocked": is_pullback_vwap_blocked,
+                "reg_open_7m_shield_blocked": False,
+                "session_vwap": sess_vwap_val,
+                "cycle_min_buy_price": c_min_p,
+                "closed_ha_shaved_bear": eff_shaved_bear,
+                "closed_ha_bull": eff_closed_ha_bull,
+                "closed_ha_ready": bool(closed_ha_ready),
+            }
+        if is_pullback_vwap_blocked:
+            return {
+                "should_buy": False,
+                "signal_type": "HOLD_PULLBACK_ABOVE_SESSION_VWAP",
+                "ref_anchor": round(ref_anchor, 4),
+                "quota_ref_price": round(ref_anchor, 4),
+                "chg_from_exit_pct": round(chg_from_exit_pct, 2),
+                "pullback_target_price": pullback_target_p,
+                "breakout_target_price": breakout_target_p,
+                "l2_ceiling_price": round(ceil_p, 4),
+                "rsi_14": eff_rsi_val,
+                "breakout_max_rsi": round(max_rsi_cap, 2),
+                "breakout_rsi_blocked": False,
+                "pullback_ha_blocked": False,
+                "pullback_vwap_blocked": True,
+                "reg_open_7m_shield_blocked": False,
+                "session_vwap": sess_vwap_val,
+                "cycle_min_buy_price": c_min_p,
+                "closed_ha_shaved_bear": eff_shaved_bear,
+                "closed_ha_bull": eff_closed_ha_bull,
+                "closed_ha_ready": bool(closed_ha_ready),
+            }
         return {
             "should_buy": True,
             "signal_type": "PULLBACK_RELOAD",
@@ -1165,6 +1378,14 @@ def evaluate_l2_only_hybrid_reentry_signal(
             "rsi_14": eff_rsi_val,
             "breakout_max_rsi": round(max_rsi_cap, 2),
             "breakout_rsi_blocked": False,
+            "pullback_ha_blocked": False,
+            "pullback_vwap_blocked": False,
+            "reg_open_7m_shield_blocked": False,
+            "session_vwap": sess_vwap_val,
+            "cycle_min_buy_price": c_min_p,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_closed_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
         }
 
     if chg_from_exit_pct >= REENTRY_BREAKOUT_RISE_PCT:
@@ -1222,6 +1443,127 @@ def evaluate_l2_only_hybrid_reentry_signal(
         "rsi_14": eff_rsi_val,
         "breakout_max_rsi": round(max_rsi_cap, 2),
         "breakout_rsi_blocked": is_breakout_rsi_blocked,
+    }
+
+
+def evaluate_l2_vacant_low_break_signal(
+    live_price: float,
+    buckets: Sequence[StratumBucket],
+    cycle_min_buy_price: float,
+    cycle_ratchet_max_lots: int = 0,
+    closed_ha_shaved_bear: Optional[bool] = None,
+    closed_ha_bull: Optional[bool] = None,
+    closed_ha_ready: bool = True,
+) -> Dict[str, Any]:
+    """
+    # NEW [Case 105 : 본 그리드 활성 1층 보유 중 [2층 공석] 최저가 돌파매수 순수 판정기]:
+    - 발동 관문: 활성 1층 보유(has_active_l1_bucket) AND 활성 2층 부재(not has_active_l2_bucket)
+                 AND 사이클 최고 도달 회차 >= 2 (2층 이상 생성 후 익절로 비워진 진성 공석)
+    - 가격 조건: 지정가(exec_lp) < 기억저가(cycle_min_buy_price) (상단 3 ~ 7층 재고 존재 시 최하단 단가 이하)
+    - 유일한 패스 필터: 직전 완결 1분봉 무머리 HA 음봉(closed_ha_shaved_bear == True 또는 미준비) 패스
+    """
+    valid = [
+        b
+        for b in (buckets or [])
+        if isinstance(b, StratumBucket) and b.qty > 0
+    ]
+    lp = safe_float(live_price, 0.0)
+    c_min = round(max(0.0, safe_float(cycle_min_buy_price, 0.0)), 4)
+    held_lots = sum(max(1, b.lot_count) for b in valid)
+    eff_ratchet = max(held_lots, max(0, safe_int(cycle_ratchet_max_lots, 0)))
+
+    active_l1 = has_active_l1_bucket(valid)
+    active_l2 = has_active_l2_bucket(valid)
+    is_eligible_l2_vac = bool(
+        active_l1 and (not active_l2) and eff_ratchet >= 2 and c_min > 0.0
+    )
+
+    has_ha_filter = closed_ha_shaved_bear is not None
+    eff_shaved_bear = bool(closed_ha_shaved_bear) if has_ha_filter else False
+    eff_ha_bull = (
+        bool(closed_ha_bull)
+        if closed_ha_bull is not None
+        else (not eff_shaved_bear)
+    )
+    is_ha_blocked = bool(
+        has_ha_filter and ((not bool(closed_ha_ready)) or eff_shaved_bear)
+    )
+
+    min_upper_p = (
+        round(min(b.book_price for b in valid[1:]), 4)
+        if len(valid) >= 2
+        else 0.0
+    )
+
+    if not is_eligible_l2_vac or lp <= 0.0:
+        return {
+            "eligible": is_eligible_l2_vac,
+            "should_buy": False,
+            "signal_type": "NOT_ELIGIBLE",
+            "quota_ref_price": c_min,
+            "cycle_min_buy_price": c_min,
+            "min_upper_tier_price": min_upper_p,
+            "pullback_ha_blocked": is_ha_blocked,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
+        }
+
+    if min_upper_p > 0.0 and lp > (min_upper_p + 1e-6):
+        return {
+            "eligible": True,
+            "should_buy": False,
+            "signal_type": "HOLD_PREVENT_INVERSION",
+            "quota_ref_price": c_min,
+            "cycle_min_buy_price": c_min,
+            "min_upper_tier_price": min_upper_p,
+            "pullback_ha_blocked": is_ha_blocked,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
+        }
+
+    exec_lp = max(0.01, math.floor((lp + 1e-9) * 100.0) / 100.0)
+    if exec_lp >= (c_min - 1e-6):
+        return {
+            "eligible": True,
+            "should_buy": False,
+            "signal_type": "HOLD_ABOVE_CYCLE_MIN",
+            "quota_ref_price": c_min,
+            "cycle_min_buy_price": c_min,
+            "min_upper_tier_price": min_upper_p,
+            "pullback_ha_blocked": is_ha_blocked,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
+        }
+
+    if is_ha_blocked:
+        return {
+            "eligible": True,
+            "should_buy": False,
+            "signal_type": "HOLD_LOW_BREAK_SHAVED_HA_BEAR",
+            "quota_ref_price": c_min,
+            "cycle_min_buy_price": c_min,
+            "min_upper_tier_price": min_upper_p,
+            "pullback_ha_blocked": True,
+            "closed_ha_shaved_bear": eff_shaved_bear,
+            "closed_ha_bull": eff_ha_bull,
+            "closed_ha_ready": bool(closed_ha_ready),
+        }
+
+    return {
+        "eligible": True,
+        "should_buy": True,
+        "signal_type": "LOW_BREAK_L2_VAC_RELOAD",
+        "quota_ref_price": c_min,
+        "exec_order_price": round(exec_lp, 2),
+        "cycle_min_buy_price": c_min,
+        "min_upper_tier_price": min_upper_p,
+        "pullback_ha_blocked": False,
+        "closed_ha_shaved_bear": eff_shaved_bear,
+        "closed_ha_bull": eff_ha_bull,
+        "closed_ha_ready": bool(closed_ha_ready),
     }
 
 

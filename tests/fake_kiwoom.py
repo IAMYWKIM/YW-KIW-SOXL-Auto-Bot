@@ -109,7 +109,9 @@ def handle(api_id, body):
         p = m.price(sym)
         rows = []
         t = now.replace(second=0, microsecond=0)
-        for i in range(600):
+        i = -1
+        while len(rows) < 600 and i < 6000:      # 주말에 시험해도 직전 평일 봉을 돌려주도록 거슬러 올라감
+            i += 1
             tt = t - timedelta(minutes=i)
             if tt.weekday() >= 5 and tt.hour >= 4:
                 continue

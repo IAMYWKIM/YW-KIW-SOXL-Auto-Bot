@@ -37,6 +37,8 @@ SECTIONS = {
         ("ALERT.STALE_CANDLE_MIN", "분봉 지연 경고 기준", "choice", [3, 5, 10, 30], lambda v: f"{v}분"),
     ], "매수·매도·졸업 알림은 원본 엔진이 따로 보냅니다. 여기는 키움 포팅판이 추가로 보내는 알림입니다."),
     "kiwoom": ("📡 키움 연결", [
+        ("KIWOOM.PRICE_GUARD_ENABLED", "이상 가격 필터", "bool", None, None),
+        ("KIWOOM.PRICE_GUARD_BAND_PCT", "필터 허용폭(1호가 대비)", "choice", [0.3, 0.5, 0.8, 1.0], lambda v: f"{v:g}%"),
         ("KIWOOM.CHART_TZ", "분봉 시간대", "choice", ["AUTO", "ET", "KST"], str),
         ("KIWOOM.QUERY_MIN_INTERVAL", "조회 최소 간격", "choice", [0.2, 0.22, 0.25, 0.34, 0.5], lambda v: f"{v}초"),
         ("KIWOOM.CANDLE_1M_CACHE_SEC", "1분봉 재조회 간격", "choice", [3.0, 4.0, 5.0, 8.0], lambda v: f"{v:g}초"),

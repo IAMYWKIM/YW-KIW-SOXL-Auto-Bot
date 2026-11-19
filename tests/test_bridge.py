@@ -62,7 +62,11 @@ async def run(dry: bool):
     from kiwoom_us_client import parse_ts14
     check("24시 이상 표기 변환", str(parse_ts14("20261110263300")) == "2026-11-11 02:33:00")
     age = b.newest_candle_age_min("SOXL")
-    check("최신 1분봉이 지금 시각과 일치", age is not None and abs(age) < 2, f"{age:+.1f}분" if age is not None else "")
+    _wk = __import__("datetime").datetime.now(__import__("zoneinfo").ZoneInfo("America/New_York")).weekday()
+    if _wk < 5:   # 주말에는 금요일 봉이 최신이라 검사하지 않음
+        check("최신 1분봉이 지금 시각과 일치", age is not None and abs(age) < 2, f"{age:+.1f}분" if age is not None else "")
+    else:
+        print("  ·  최신 1분봉 시각 검사: 주말이라 건너뜀")
     r = (await b.request("GET", "/api/v1/orderbook", params={"symbol": "SOXL"}))["result"]
     check("호가", float(r["bids"][0]["price"]) < float(r["asks"][0]["price"]))
     r = (await b.request("GET", "/api/v1/trades", params={"symbol": "SOXL", "count": 15}))["result"]

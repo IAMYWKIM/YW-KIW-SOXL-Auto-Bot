@@ -124,6 +124,9 @@ DEFAULTS = {
         "DEPOSIT_CACHE_SEC": 1.5,
         "CANDLE_1M_CACHE_SEC": 4.0,
         "CANDLE_1D_CACHE_SEC": 300,
+        "PRICE_GUARD_ENABLED": True,      # 이상 가격 필터 (price_guard.py): 호가 범위를 벗어난 현재가·체결틱·분봉 보정
+        "PRICE_GUARD_BAND_PCT": 0.5,      # 1호가에서 이 % 넘게 벗어나면 이상 가격 (실측: 정상은 0.3% 이내)
+        "PRICE_GUARD_BAR_BAND_PCT": 2.0,  # 기동 전 과거 분봉: 앞뒤 5봉 중앙값에서 이 % 넘게 벗어난 값 보정
         "SHM_BUS_DIR": "/dev/shm/kiw_soxl_bus_v3",   # v18 원본 공유 버스(시세·10G 신호) 폴더. 토스봇과 분리
         "CANDLE_MAX_PAGES": 4,
         "BUYING_POWER_SOURCE": "FC_ORD_ALOWA",

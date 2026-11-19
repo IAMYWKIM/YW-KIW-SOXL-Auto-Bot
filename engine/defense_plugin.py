@@ -86,6 +86,7 @@ from toss_api import (
     EST_TZ,
     TARGET_SYMBOL,
     get_folder_slug,
+    resolve_trading_session_date_est,
     safe_float,
     safe_int,
 )
@@ -250,12 +251,34 @@ async def _sync_barbell_sgov_holdings_if_idle(
 
         if h_sg_qty < l_sg_qty:
             freed_sg_usd = max(0.0, old_sg_inv - new_sg_inv)
-            max_liq_sg = max(
-                0.0, (cash_10_sg + sgov_30_sg) - new_sg_inv - cur_pend_b
+            has_soxl_pos_sg = bool(
+                st_soxl_sg.get("buckets")
+                or st_soxl_sg.get("sub_buckets")
+                or str(st_soxl_sg.get("buy_order_id") or "").strip()
             )
-            next_cash_sg = round(min(max_liq_sg, cur_cash_b + freed_sg_usd), 4)
+            if has_soxl_pos_sg:
+                # MODIFIED [Case 102]: 미졸업(SOXL > 0주) 중 수동 SGOV 매도 시 매도이력 각인 및 재매수 예약 $0 잠금
+                upd_sg["sgov_tranche_sells_done_cycle"] = (
+                    safe_int(bst.get("sgov_tranche_sells_done_cycle"), 0) + 1
+                )
+                upd_sg["pending_sgov_buy_budget_usd"] = 0.0
+                max_liq_sg = max(
+                    0.0, (cash_10_sg + sgov_30_sg) - new_sg_inv
+                )
+                next_cash_sg = round(
+                    min(max_liq_sg, cur_cash_b + cur_pend_b + freed_sg_usd), 4
+                )
+                eff_pend_sg = 0.0
+            else:
+                max_liq_sg = max(
+                    0.0, (cash_10_sg + sgov_30_sg) - new_sg_inv - cur_pend_b
+                )
+                next_cash_sg = round(
+                    min(max_liq_sg, cur_cash_b + freed_sg_usd), 4
+                )
+                eff_pend_sg = cur_pend_b
             upd_sg["cash_bucket_usd"] = next_cash_sg
-            if (soxl_free_sg + next_cash_sg + cur_pend_b) >= (
+            if (soxl_free_sg + next_cash_sg + eff_pend_sg) >= (
                 guard_floor_sg - 1e-6
             ):
                 upd_sg["pending_sgov_tranche_sells"] = 0
@@ -303,6 +326,27 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         return {"status": "SKIP_HOLDINGS_NOT_READY"}
 
     st = context.ledger.get_state(TARGET_SYMBOL)
+    dt_sess_chk = (
+        now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    )
+    sess_date_chk = resolve_trading_session_date_est(
+        dt_sess_chk,
+        last_closing_report_date=str(
+            st.get("last_closing_report_date") or ""
+        ),
+    )
+    if str(st.get("logical_date") or "") < sess_date_chk and hasattr(
+        context.ledger, "rollover_daily_counters_if_needed"
+    ):
+        st = await context.ledger.rollover_daily_counters_if_needed(
+            sess_date_chk
+        )
+        try:
+            await ensure_barbell_ledger(context).rollover_daily_if_needed(
+                sess_date_chk
+            )
+        except Exception:
+            pass
     portion_mode = (
         str(st.get("portion_mode") or PORTION_MODE_COMPOUND).upper().strip()
     )
@@ -556,10 +600,13 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
         )
 
-        # MODIFIED: 수동 부분손절 후 전량매도 시 사이클 순흑자 초과분만 금고 격리
+        # MODIFIED [Case 94]: 선행 익절 격리분(prev_cyc_vz) 차감 결손 보전 후 순흑자만 금고 격리
         prev_cyc_z = safe_float(st.get("cycle_realized_net_usd"), 0.0)
+        prev_cyc_vz = max(
+            0.0, safe_float(st.get("cycle_vaulted_locked_usd"), 0.0)
+        )
         vault_delta_z = round(
-            max(0.0, net_pnl + min(0.0, prev_cyc_z)), 4
+            max(0.0, net_pnl + min(0.0, prev_cyc_z - prev_cyc_vz)), 4
         )
         prev_vault_locked = max(
             0.0, safe_float(st.get("vaulted_profit_locked_usd"), 0.0)
@@ -568,6 +615,9 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             round(prev_vault_locked + vault_delta_z, 4)
             if is_barbell
             else prev_vault_locked
+        )
+        final_cyc_v_locked = (
+            round(prev_cyc_vz + vault_delta_z, 4) if is_barbell else 0.0
         )
 
         final_cyc_net = round(prev_cyc_z + net_pnl, 4)
@@ -711,6 +761,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             cycle_sub_realized_net_usd=0.0,
             cycle_sell_events=0,
             cycle_leftover_saved_usd=0.0,
+            cycle_vaulted_locked_usd=0.0,
             last_cycle_realized_net_usd=final_cyc_net,
             last_cycle_sell_events=final_cyc_ev,
             completed_main_cycles=next_comp_main_cycles,
@@ -724,7 +775,9 @@ async def reconcile_stratum_with_broker_holdings_plugin(
                 is_graduated_zero=True,
                 prev_soxl_injected_usd=cur_inj_res_usd,
                 prev_soxl_used_portions_cnt=cur_used_res_cnt,
-                cycle_realized_net_override=final_cyc_net,
+                cycle_realized_net_override=round(
+                    final_cyc_net - final_cyc_v_locked, 4
+                ),
             )
             barbell_vault_total = safe_float(
                 b_rec.get("vault_realized_profit_usd"), next_vault_locked
@@ -1601,10 +1654,13 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         safe_float(st.get("daily_realized_net_usd"), 0.0) + net_pnl, 4
     )
 
-    # MODIFIED: 수동 부분손절 후 부분익절 시 사이클 결손 우선 보전
+    # MODIFIED [Case 94]: 선행 익절 격리분(prev_cyc_vp) 차감 결손 보전 후 순흑자만 금고 격리
     prev_cyc_p = safe_float(st.get("cycle_realized_net_usd"), 0.0)
+    prev_cyc_vp = max(
+        0.0, safe_float(st.get("cycle_vaulted_locked_usd"), 0.0)
+    )
     vault_delta_p = round(
-        max(0.0, net_pnl + min(0.0, prev_cyc_p)), 4
+        max(0.0, net_pnl + min(0.0, prev_cyc_p - prev_cyc_vp)), 4
     )
     prev_vault_locked_p = max(
         0.0, safe_float(st.get("vaulted_profit_locked_usd"), 0.0)
@@ -1613,6 +1669,9 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         round(prev_vault_locked_p + vault_delta_p, 4)
         if is_barbell
         else prev_vault_locked_p
+    )
+    cur_cyc_vp = (
+        round(prev_cyc_vp + vault_delta_p, 4) if is_barbell else 0.0
     )
 
     cur_cyc_gross = round(
@@ -1741,6 +1800,7 @@ async def reconcile_stratum_with_broker_holdings_plugin(
         "cycle_realized_net_usd": cur_cyc_net,
         "cycle_sub_realized_net_usd": cur_cyc_sub_net,
         "cycle_sell_events": cur_cyc_ev,
+        "cycle_vaulted_locked_usd": cur_cyc_vp,
     }
     if sold_sub_q > 0:
         part_update_kw["last_sub_sell_fill_ts"] = now_part_sell_ts
@@ -1766,7 +1826,9 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             prev_soxl_used_portions_cnt=safe_int(
                 st.get("used_reserve_portions_cnt"), 0
             ),
-            cycle_realized_net_override=cur_cyc_net,
+            cycle_realized_net_override=round(
+                cur_cyc_net - cur_cyc_vp, 4
+            ),
         )
         barbell_vault_part = safe_float(
             b_rec_p.get("vault_realized_profit_usd"), next_vault_locked_p
@@ -1797,13 +1859,9 @@ async def reconcile_stratum_with_broker_holdings_plugin(
             else ""
         )
         if is_barbell:
+            # MODIFIED [Case 102]: 수동 부분매도 환수금 보호 현금버킷 보존 및 0주 졸업 시 SGOV 원복 표기
             rt_part_note = (
-                f" · ⚡실시간환수 ${repaid_part_soxl:,.0f}(현금 ${cash_b_part:,.0f}"
-                + (
-                    f"·SGOV예약 +${added_part_sgov:,.0f})"
-                    if added_part_sgov > 0.0
-                    else ")"
-                )
+                f" · ⚡실시간환수 ${repaid_part_soxl:,.0f}(보호현금버킷 ${cash_b_part:,.0f} 보존➔0주 SGOV원복)"
                 if repaid_part_soxl > 0.0
                 else ""
             )
@@ -2047,18 +2105,6 @@ async def execute_0400_premarket_stabilization_plugin(
         us_commission_rate=us_comm_r,
         round_trip_fee_rate_pct=rt_fee_pct,
         **clear_0400_ord_kw,
-        daily_seed_protect_pass_cnt=0,
-        daily_unlock_buy_events=0,
-        daily_sub_buy_cnt=0,
-        daily_sub_buy_events=0,
-        daily_sub_sell_cnt=0,
-        daily_sub_sell_events=0,
-        daily_sub_unlock_events=0,
-        daily_sub_realized_net_usd=0.0,
-        daily_main_buy_cnt=0,
-        daily_main_sell_cnt=0,
-        daily_reserve_injected_cnt=0,
-        daily_dust_guard_blocked_cnt=0,
         last_evaluated_buy_bucket_id=-1,
         last_evaluated_date=today_str,
         sub_last_evaluated_buy_bucket_id=-1,
@@ -2077,7 +2123,7 @@ async def execute_0400_premarket_stabilization_plugin(
     )
 
     logger.info(
-        "🌅 [04:00 EST 프리장 오프닝 안정화 완료] 당일 카운터 0회 리셋 · 왕복수수료=%.2f%% · 잔류주문 취소=%d건 · 그리드동기화=%s",
+        "🌅 [04:00 EST 프리장 오프닝 안정화 완료] 오버나이트(16:01~03:59) 확정수익 보존 · 왕복수수료=%.2f%% · 잔류주문 취소=%d건 · 그리드동기화=%s",
         rt_fee_pct,
         canceled_cnt,
         sync_res.get("status"),
@@ -2110,6 +2156,10 @@ async def execute_1600_daily_closing_settlement_plugin(
             await context.ledger.rollover_daily_counters_if_needed(today_str)
         except Exception as exc:
             logger.debug("16:00 마감 선행 일일 롤오버 예외(묵음): %s", exc)
+    try:
+        await ensure_barbell_ledger(context).rollover_daily_if_needed(today_str)
+    except Exception:
+        pass
 
     st = context.ledger.get_state(TARGET_SYMBOL)
     if str(st.get("last_closing_report_date") or "") == today_str:
@@ -2380,12 +2430,29 @@ async def execute_1600_daily_closing_settlement_plugin(
                 f"{sub_day_note}{res_note} "
                 f"· 🛡️시드패스 {day_pass:,}회 / 자투리절약 +${day_saved:,.2f} "
                 f"· 오버나이트 이월: 본 {held_sh}주({held_tiers}개층·{lot_carry_str}){sub_carry_note} · 가용현금 ${free_cash:,.2f} "
-                f"(🌇애프터·🌃데이장 ⚡1.5s 방안 C 통합졸업감시 연속가동 · 개별층/매수잠금)"
+                f"(🌇애프터·🌃데이장 ⚡1.5s 본1·2층 개별채굴 & 3~7층 통합졸업 연속가동 · 매수잠금)"
             ),
         )
 
+    next_sess_date = resolve_trading_session_date_est(
+        dt_now, after_1600_close=True
+    )
+    if hasattr(context.ledger, "rollover_daily_counters_if_needed"):
+        try:
+            await context.ledger.rollover_daily_counters_if_needed(
+                next_sess_date
+            )
+        except Exception as exc:
+            logger.debug("16:00 결산 후 차기 세션 롤오버 예외(묵음): %s", exc)
+    try:
+        await ensure_barbell_ledger(context).rollover_daily_if_needed(
+            next_sess_date
+        )
+    except Exception:
+        pass
+
     logger.info(
-        "🌙 [16:00 EST 일일 결산 완료 · %s · %s] 당일실현=$%.2f · 이번사이클=$%.2f · 누적실현=$%.2f · 본동결=%d일 · 서브동결=%d일",
+        "🌙 [16:00 EST 일일 결산 완료 · %s · %s] 당일실현=$%.2f · 이번사이클=$%.2f · 누적실현=$%.2f · 본동결=%d일 · 서브동결=%d일 · 차기세션=%s",
         folder_slug,
         mode_lbl,
         day_net,
@@ -2393,10 +2460,12 @@ async def execute_1600_daily_closing_settlement_plugin(
         cum_net,
         next_main_frozen,
         next_sub_frozen,
+        next_sess_date,
     )
     return {
         "status": "DAILY_CLOSING_SETTLEMENT_DONE",
         "date": today_str,
+        "next_session_date": next_sess_date,
         "portion_mode": summary.get("portion_mode"),
         "daily_realized_net_usd": day_net,
         "daily_withdrawable_profit_usd": max(0.0, day_net),
@@ -2430,10 +2499,13 @@ async def execute_daily_1700_gc_and_backup_plugin(
         except Exception as exc:
             logger.warning("17:00 EST 원장 스냅샷 백업 예외: %s", exc)
 
-    await context.ledger.rollover_daily_counters_if_needed(logical_date)
+    next_gc_sess_date = resolve_trading_session_date_est(
+        dt_now, after_1600_close=True
+    )
+    await context.ledger.rollover_daily_counters_if_needed(next_gc_sess_date)
     try:
         await ensure_barbell_ledger(context).rollover_daily_if_needed(
-            logical_date
+            next_gc_sess_date
         )
     except Exception:
         pass

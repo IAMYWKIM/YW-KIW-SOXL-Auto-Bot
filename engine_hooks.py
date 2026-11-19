@@ -34,6 +34,7 @@ HOOK_TARGETS = (
     ("toss_api", None, "_NonRetryableApiError"),
     ("plugin_updater", None, "execute_git_pull_and_preflight"),
     ("plugin_updater", None, "run_auto_update_loop"),
+    ("plugin_updater", None, "perform_self_restart_execv"),
     ("tg_ui_plugin", "TelegramCommandController", "_handle_command_or_text"),
     ("tg_ui_plugin", "TelegramCommandController", "_handle_callback_query"),
     ("tg_ui_plugin", "TelegramCommandController", "send_message"),
@@ -182,6 +183,58 @@ def install(bridge) -> None:
         for nm in ("run_auto_update_loop", "auto_update_loop", "start_auto_update_loop",
                    "background_auto_update_loop"):
             _patch_everywhere(nm, _idle_update_loop)
+
+    # ── 2-b) 엔진 자가 재기동(os.execv)은 반드시 포팅판 main.py 로 (v1.0.11) ─────
+    # 원본 v24(Case 108)부터 워커 종료·이벤트루프 5분 정지 때 스스로 재기동합니다. 원본 구현은 sys.argv[0] 을
+    # 실행 폴더 기준으로 다시 찾기 때문에, 상대 경로로 띄운 경우 run/<모드>/main.py(원본)가 연결 고리 없이
+    # 뜰 수 있습니다. 여기서 항상 포팅판 main.py 절대 경로로 재기동하도록 바꿉니다.
+    orig_release = getattr(m["plugin_updater"], "release_bot_singleton_lock_sync", None)
+
+    def _safe_restart(reason: str = "AUTO_UPDATE"):
+        import json, time as _t
+        log.warning("엔진 재기동 요청 (사유=%s) → 포팅판 main.py 로 재기동합니다", reason)
+        try:
+            store.add_event("ENGINE_RESTART", f"엔진 자가 재기동: {reason}", str(reason))
+        except Exception:
+            pass
+        try:
+            mirror_ledgers()
+        except Exception:
+            pass
+        delay = 0.0
+        try:                                    # 재기동 폭주 방지: 10분 안에 5번째부터는 60초 쉬고 재기동
+            f = config.DATA_DIR / "engine_restarts.json"
+            now = _t.time()
+            hist = [x for x in (json.loads(f.read_text()) if f.exists() else []) if now - x < 600] + [now]
+            f.write_text(json.dumps(hist))
+            if len(hist) >= 5:
+                delay = 60.0
+                log.error("10분 안에 재기동 %d회 — 60초 쉰 뒤 재기동합니다 (원인: 로그의 '재기동 요청' 사유 확인)", len(hist))
+        except Exception:
+            pass
+        try:
+            if callable(orig_release):
+                orig_release()
+        except Exception:
+            pass
+        if delay:
+            _t.sleep(delay)
+        for st in (sys.stdout, sys.stderr):
+            try:
+                st.flush()
+            except Exception:
+                pass
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        exe = sys.executable or "/usr/bin/python3"
+        try:
+            os.chdir(str(config.BASE_DIR))
+            os.execv(exe, [exe, "-B", str(config.BASE_DIR / "main.py")])
+        except Exception as e:
+            log.error("재기동 실패(%s) → 종료 코드 1 로 끝내 systemd 가 다시 띄우게 합니다", e)
+            os._exit(1)
+
+    _patch_everywhere("perform_self_restart_execv", _safe_restart)
+    runtime.safe_restart = _safe_restart
 
     # ── 3) 엔진 컨텍스트 붙잡기 ─────────────────────────────────────
     ctx_cls = m["main"].SniperAppContext

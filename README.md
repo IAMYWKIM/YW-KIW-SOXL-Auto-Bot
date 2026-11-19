@@ -1,6 +1,6 @@
 # kiw_soxl_trader — 키움증권 해외주식 SOXL 스나이퍼 자동매매 봇
 
-**버전: v1.0.7 (2026-11-13)** · 서비스명 `kiwoombot_soxl` · 로그 프리픽스 `[SOXL]`
+**버전: v1.0.12 (2026-11-19)** · 서비스명 `kiwoombot_soxl` · 로그 프리픽스 `[SOXL]`
 
 토스증권용 「인피니트 스노우볼 v3.0」(pipios · SOXL 7층 그리드 스나이퍼)을 **키움증권 REST API(미국주식)** 로
 운용하도록 포팅한 프로그램입니다. kiw_scalp_trader / kiw_close_trader 와 코드·상태·텔레그램 봇을 공유하지 않습니다.

@@ -24,7 +24,8 @@ def period_range(kind: str, ref: str = None):
         mon = d - timedelta(days=d.weekday())
         fri = mon + timedelta(days=4)
         iso = mon.isocalendar()
-        return (mon.strftime("%Y-%m-%d"), fri.strftime("%Y-%m-%d"), f"주간 {iso[0]}-W{iso[1]:02d}",
+        sun = mon + timedelta(days=6)   # 집계는 월~일(주말에 찍힌 기록도 포함), 표시는 월~금
+        return (mon.strftime("%Y-%m-%d"), sun.strftime("%Y-%m-%d"), f"주간 {iso[0]}-W{iso[1]:02d}",
                 f"주간보고_{iso[0]}-W{iso[1]:02d}({mon:%m%d}-{fri:%m%d})")
     if kind == "month":
         first = d.replace(day=1)

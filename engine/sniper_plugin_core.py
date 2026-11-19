@@ -47,6 +47,7 @@ from quant_engine import (
     buckets_to_dicts,
     evaluate_guard30_and_reserve_injection,
     has_active_l1_bucket,
+    has_active_l2_bucket,
     is_simple_income_mode,
     resolve_effective_round_trip_fee_rate_pct,
     resolve_portion_budget_base_equity,
@@ -129,9 +130,13 @@ def mark_auto_fill_grace_shield(
                 updated["last_sub_buy_fill_ts"] = now_epoch
                 updated["last_sub_reentry_eval_mono"] = 0.0
                 updated["last_sub_reentry_eval_ts"] = 0.0
+                updated["sub_pullback_ha_wait_min_key"] = ""
+                updated["sub_pullback_ha_wait_mono"] = 0.0
             else:
                 updated["last_reentry_eval_mono"] = 0.0
                 updated["last_reentry_eval_ts"] = 0.0
+                updated["pullback_ha_wait_min_key"] = ""
+                updated["pullback_ha_wait_mono"] = 0.0
             updated["last_reserve_check_mono"] = 0.0
             updated["last_reserve_check_ts"] = 0.0
         else:
@@ -229,6 +234,46 @@ def is_within_auto_fill_grace_shield(
 # ---------------------------------------------------------------------------
 # [Case 73, Case 77 & Case 88] 본 그리드 / 서브 그리드 1층 공석 60초 재장전 타임쉴드 & 시드고갈 60초 입금 감지 타임쉴드 관리기
 # ---------------------------------------------------------------------------
+def mark_pullback_ha_bear_minute_wait(
+    context: Any,
+    symbol: str = TARGET_SYMBOL,
+    cur_min_key: str = "",
+) -> None:
+    # NEW: -1.00% 눌림목 HA 음봉 대기 시 차기 1분봉 완료 정각(00초) 즉시 재검문용 분 경계 마커
+    sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    mk = str(cur_min_key or datetime.now(EST_TZ).strftime("%Y-%m-%d %H:%M")).strip()
+    now_mono = time.monotonic()
+    for cache_attr in ("indexing_grace_cache", "exit_snapshot_cache"):
+        cmap = getattr(context, cache_attr, None)
+        if isinstance(cmap, dict):
+            ent = cmap.get(sym) if isinstance(cmap.get(sym), dict) else {}
+            ent["last_reentry_eval_mono"] = 0.0
+            ent["last_reentry_eval_ts"] = 0.0
+            ent["pullback_ha_wait_min_key"] = mk
+            ent["pullback_ha_wait_mono"] = now_mono
+            cmap[sym] = ent
+
+
+def mark_sub_pullback_ha_bear_minute_wait(
+    context: Any,
+    symbol: str = TARGET_SYMBOL,
+    cur_min_key: str = "",
+) -> None:
+    # NEW: 서브 그리드 -1.00% 눌림목 HA 음봉 대기 시 차기 1분봉 완료 정각 즉시 재검문 마커
+    sym = str(symbol or TARGET_SYMBOL).upper().strip()
+    mk = str(cur_min_key or datetime.now(EST_TZ).strftime("%Y-%m-%d %H:%M")).strip()
+    now_mono = time.monotonic()
+    for cache_attr in ("indexing_grace_cache", "exit_snapshot_cache"):
+        cmap = getattr(context, cache_attr, None)
+        if isinstance(cmap, dict):
+            ent = cmap.get(sym) if isinstance(cmap.get(sym), dict) else {}
+            ent["last_sub_reentry_eval_mono"] = 0.0
+            ent["last_sub_reentry_eval_ts"] = 0.0
+            ent["sub_pullback_ha_wait_min_key"] = mk
+            ent["sub_pullback_ha_wait_mono"] = now_mono
+            cmap[sym] = ent
+
+
 def mark_reentry_monitor_60s_cycle_shield(
     context: Any,
     symbol: str = TARGET_SYMBOL,
@@ -246,6 +291,8 @@ def mark_reentry_monitor_60s_cycle_shield(
         )
         g_entry["last_reentry_eval_mono"] = now_mono
         g_entry["last_reentry_eval_ts"] = now_epoch
+        g_entry["pullback_ha_wait_min_key"] = ""
+        g_entry["pullback_ha_wait_mono"] = 0.0
         if eval_price > 0.0:
             g_entry["last_reentry_eval_price"] = round(
                 safe_float(eval_price, 0.0), 4
@@ -259,6 +306,8 @@ def mark_reentry_monitor_60s_cycle_shield(
         )
         s_entry["last_reentry_eval_mono"] = now_mono
         s_entry["last_reentry_eval_ts"] = now_epoch
+        s_entry["pullback_ha_wait_min_key"] = ""
+        s_entry["pullback_ha_wait_mono"] = 0.0
         if eval_price > 0.0:
             s_entry["last_reentry_eval_price"] = round(
                 safe_float(eval_price, 0.0), 4
@@ -272,6 +321,7 @@ def is_within_reentry_monitor_time_shield(
     context: Any,
     st: Optional[Dict[str, Any]] = None,
     symbol: str = TARGET_SYMBOL,
+    now_est: Optional[datetime] = None,
 ) -> Tuple[bool, float]:
     in_post_sell, rem_sell = is_within_post_sell_time_shield(
         context, st, symbol
@@ -285,11 +335,21 @@ def is_within_reentry_monitor_time_shield(
 
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     now_mono = time.monotonic()
+    dt_chk = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    cur_mk = dt_chk.strftime("%Y-%m-%d %H:%M")
+    rem_next_min = max(
+        0.5,
+        60.0 - (float(dt_chk.second) + float(dt_chk.microsecond) / 1000000.0),
+    )
 
     guard_map = getattr(context, "indexing_grace_cache", None)
     if isinstance(guard_map, dict):
         g_entry = guard_map.get(sym)
         if isinstance(g_entry, dict):
+            w_mk = str(g_entry.get("pullback_ha_wait_min_key") or "").strip()
+            w_mono = safe_float(g_entry.get("pullback_ha_wait_mono"), 0.0)
+            if w_mk and w_mk == cur_mk and 0.0 <= (now_mono - w_mono) < 65.0:
+                return True, round(rem_next_min, 1)
             re_mono = safe_float(g_entry.get("last_reentry_eval_mono"), 0.0)
             if re_mono > 0.0:
                 elapsed_g = now_mono - re_mono
@@ -302,6 +362,10 @@ def is_within_reentry_monitor_time_shield(
     if isinstance(snap_map, dict):
         s_entry = snap_map.get(sym)
         if isinstance(s_entry, dict):
+            sw_mk = str(s_entry.get("pullback_ha_wait_min_key") or "").strip()
+            sw_mono = safe_float(s_entry.get("pullback_ha_wait_mono"), 0.0)
+            if sw_mk and sw_mk == cur_mk and 0.0 <= (now_mono - sw_mono) < 65.0:
+                return True, round(rem_next_min, 1)
             s_re_mono = safe_float(s_entry.get("last_reentry_eval_mono"), 0.0)
             if s_re_mono > 0.0:
                 elapsed_s = now_mono - s_re_mono
@@ -345,6 +409,8 @@ def mark_sub_reentry_monitor_60s_cycle_shield(
         )
         g_entry["last_sub_reentry_eval_mono"] = now_mono
         g_entry["last_sub_reentry_eval_ts"] = now_epoch
+        g_entry["sub_pullback_ha_wait_min_key"] = ""
+        g_entry["sub_pullback_ha_wait_mono"] = 0.0
         if eval_price > 0.0:
             g_entry["last_sub_reentry_eval_price"] = round(
                 safe_float(eval_price, 0.0), 4
@@ -358,6 +424,8 @@ def mark_sub_reentry_monitor_60s_cycle_shield(
         )
         s_entry["last_sub_reentry_eval_mono"] = now_mono
         s_entry["last_sub_reentry_eval_ts"] = now_epoch
+        s_entry["sub_pullback_ha_wait_min_key"] = ""
+        s_entry["sub_pullback_ha_wait_mono"] = 0.0
         if eval_price > 0.0:
             s_entry["last_sub_reentry_eval_price"] = round(
                 safe_float(eval_price, 0.0), 4
@@ -371,6 +439,7 @@ def is_within_sub_reentry_monitor_time_shield(
     context: Any,
     st: Optional[Dict[str, Any]] = None,
     symbol: str = TARGET_SYMBOL,
+    now_est: Optional[datetime] = None,
 ) -> Tuple[bool, float]:
     in_post_sell, rem_sell = is_within_post_sell_time_shield(
         context, st, symbol
@@ -384,11 +453,25 @@ def is_within_sub_reentry_monitor_time_shield(
 
     sym = str(symbol or TARGET_SYMBOL).upper().strip()
     now_mono = time.monotonic()
+    dt_chk = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    cur_mk = dt_chk.strftime("%Y-%m-%d %H:%M")
+    rem_next_min = max(
+        0.5,
+        60.0 - (float(dt_chk.second) + float(dt_chk.microsecond) / 1000000.0),
+    )
 
     guard_map = getattr(context, "indexing_grace_cache", None)
     if isinstance(guard_map, dict):
         g_entry = guard_map.get(sym)
         if isinstance(g_entry, dict):
+            sw_mk = str(
+                g_entry.get("sub_pullback_ha_wait_min_key") or ""
+            ).strip()
+            sw_mono = safe_float(
+                g_entry.get("sub_pullback_ha_wait_mono"), 0.0
+            )
+            if sw_mk and sw_mk == cur_mk and 0.0 <= (now_mono - sw_mono) < 65.0:
+                return True, round(rem_next_min, 1)
             sub_re_mono = safe_float(
                 g_entry.get("last_sub_reentry_eval_mono"), 0.0
             )
@@ -403,6 +486,18 @@ def is_within_sub_reentry_monitor_time_shield(
     if isinstance(snap_map, dict):
         s_entry = snap_map.get(sym)
         if isinstance(s_entry, dict):
+            ssw_mk = str(
+                s_entry.get("sub_pullback_ha_wait_min_key") or ""
+            ).strip()
+            ssw_mono = safe_float(
+                s_entry.get("sub_pullback_ha_wait_mono"), 0.0
+            )
+            if (
+                ssw_mk
+                and ssw_mk == cur_mk
+                and 0.0 <= (now_mono - ssw_mono) < 65.0
+            ):
+                return True, round(rem_next_min, 1)
             s_sub_re_mono = safe_float(
                 s_entry.get("last_sub_reentry_eval_mono"), 0.0
             )
@@ -571,7 +666,9 @@ def _get_live_soxl_price(
 async def _fetch_fresh_current_soxl_price(
     context: Any,
     fallback_price: float = 0.0,
+    now_est: Optional[datetime] = None,
 ) -> float:
+    # MODIFIED: 시뮬레이션/런타임 시계열(now_est) 일관 전달로 분봉 경계 역전 오염 차단
     try:
         try:
             fresh_map = (
@@ -596,7 +693,9 @@ async def _fetch_fresh_current_soxl_price(
                 base_met = context.candle_metrics_cache.get(TARGET_SYMBOL)
                 if isinstance(base_met, dict):
                     context.candle_metrics_cache[TARGET_SYMBOL] = (
-                        refresh_metrics_with_live_tick(base_met, fresh_p)
+                        refresh_metrics_with_live_tick(
+                            base_met, fresh_p, now_est=now_est
+                        )
                     )
             return fresh_p
     except Exception as exc:
@@ -604,11 +703,12 @@ async def _fetch_fresh_current_soxl_price(
     return safe_float(fallback_price, 0.0)
 
 
-async def _get_live_soxl_rsi_14(
+async def _get_live_soxl_reentry_snapshot(
     context: Any,
     live_price: float = 0.0,
     now_est: Optional[datetime] = None,
-) -> float:
+) -> Tuple[float, bool, bool, str]:
+    # NEW: 1층 공석 재장전용 실시간 RSI(14) + 직전 완결 1분봉 HA 양봉 스냅샷 추출기
     dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
     lp = safe_float(live_price, 0.0)
     raw_cache = getattr(context, "candle_metrics_cache", None)
@@ -619,7 +719,9 @@ async def _get_live_soxl_rsi_14(
     last_warm_m = safe_float(getattr(context, "_last_rsi_warm_mono", 0.0), 0.0)
     if (
         not isinstance(base_met, dict)
+        or not bool(base_met.get("anchors_ready", False))
         or not bool(base_met.get("rsi_ready", False))
+        or not bool(base_met.get("closed_ha_ready", False))
         or safe_float(base_met.get("prev_bar_close"), 0.0) <= 0.0
     ) and (time.monotonic() - last_warm_m) >= 10.0:
         if context is not None:
@@ -646,7 +748,7 @@ async def _get_live_soxl_rsi_14(
                         c_1d or [],
                     )
             except Exception as exc:
-                logger.debug("RSI(14) 온디맨드 400봉 프리워밍 폴백: %s", exc)
+                logger.debug("재장전 400봉 프리워밍 폴백: %s", exc)
 
     met = refresh_metrics_with_live_tick(
         base_met if isinstance(base_met, dict) else {},
@@ -655,7 +757,63 @@ async def _get_live_soxl_rsi_14(
     )
     if isinstance(raw_cache, dict):
         raw_cache[TARGET_SYMBOL] = met
-    return round(safe_float(met.get("rsi_14"), 50.0), 2)
+    rsi_val = round(safe_float(met.get("rsi_14"), 50.0), 2)
+    closed_shaved_bear = bool(met.get("closed_ha_shaved_bear", False))
+    closed_bull = bool(met.get("closed_ha_bull", True))
+    closed_ready = bool(met.get("closed_ha_ready", False))
+    closed_mk = str(met.get("closed_bar_minute_key") or "").strip()
+    return (
+        rsi_val,
+        closed_shaved_bear,
+        closed_bull,
+        closed_ready,
+        closed_mk,
+    )
+
+
+def _get_cached_soxl_session_vwap(
+    context: Any,
+    live_price: float = 0.0,
+    now_est: Optional[datetime] = None,
+) -> float:
+    """
+    # NEW [Case 105 : 세션별 누적 VWAP O(1) 무부하 추출기]:
+    - 프리장(04:07 ~ 09:29 EST): 당일 프리마켓 누적 VWAP (premarket_vwap)
+    - 정규장(09:30 ~ 16:00 EST): 당일 정규장 누적 VWAP (regular_vwap)
+    """
+    _ = live_price
+    dt_now = now_est.astimezone(EST_TZ) if now_est else datetime.now(EST_TZ)
+    hm_now = dt_now.hour * 100 + dt_now.minute
+    raw_cache = getattr(context, "candle_metrics_cache", None)
+    met = (
+        raw_cache.get(TARGET_SYMBOL)
+        if isinstance(raw_cache, dict)
+        else None
+    )
+    if not isinstance(met, dict):
+        return 0.0
+    if 407 <= hm_now <= 929:
+        v_pre = safe_float(met.get("premarket_vwap"), 0.0)
+        if v_pre <= 0.0:
+            v_pre = safe_float(met.get("vwap"), 0.0)
+        return round(max(0.0, v_pre), 4)
+    if 930 <= hm_now <= 1600:
+        v_reg = safe_float(met.get("regular_vwap"), 0.0)
+        if v_reg <= 0.0:
+            v_reg = safe_float(met.get("vwap"), 0.0)
+        return round(max(0.0, v_reg), 4)
+    return round(max(0.0, safe_float(met.get("vwap"), 0.0)), 4)
+
+
+async def _get_live_soxl_rsi_14(
+    context: Any,
+    live_price: float = 0.0,
+    now_est: Optional[datetime] = None,
+) -> float:
+    rsi_val, *_ = await _get_live_soxl_reentry_snapshot(
+        context=context, live_price=live_price, now_est=now_est
+    )
+    return rsi_val
 
 
 def min_req_cash_str(val: float) -> str:
@@ -1021,7 +1179,11 @@ async def _commit_filled_buy_to_stratum_ledger(
         sub_tag = (
             "SUB_REENTRY_1FL"
             if raw_tag
-            in ("SUB_REENTRY_1FL_BREAKOUT", "SUB_REENTRY_1FL_PULLBACK")
+            in (
+                "SUB_REENTRY_1FL_BREAKOUT",
+                "SUB_REENTRY_1FL_PULLBACK",
+                "SUB_REENTRY_1FL_LOW_BREAK",
+            )
             else raw_tag
         )
         raw_sub_budget = safe_float(portion_budget, 0.0)
@@ -1237,8 +1399,13 @@ async def _commit_filled_buy_to_stratum_ledger(
                     f"{q_int}주 @ ${fill_p:.2f}"
                 )
             elif was_sub_l2_only and sub_tag == "SUB_REENTRY_1FL":
+                sub_re_lbl = (
+                    "최저가 돌파 재장전"
+                    if raw_tag == "SUB_REENTRY_1FL_LOW_BREAK"
+                    else "재장전"
+                )
                 title_str = (
-                    f"🛡️ [SOXL 서브그리드 1층 재장전 체결 ({new_sub_lots}/{SUB_MAX_TOTAL_LOTS_4}회분 · {new_sub_tiers}개층)] "
+                    f"🛡️ [SOXL 서브그리드 1층 {sub_re_lbl} 체결 ({new_sub_lots}/{SUB_MAX_TOTAL_LOTS_4}회분 · {new_sub_tiers}개층)] "
                     f"{q_int}주 @ ${fill_p:.2f}"
                 )
             else:
@@ -1280,8 +1447,13 @@ async def _commit_filled_buy_to_stratum_ledger(
     # -----------------------------------------------------------------------
     tag = (
         "REENTRY_1FL"
-        if raw_tag in ("REENTRY_1FL_BREAKOUT", "REENTRY_1FL_PULLBACK")
-        else raw_tag
+        if raw_tag
+        in (
+            "REENTRY_1FL_BREAKOUT",
+            "REENTRY_1FL_PULLBACK",
+            "REENTRY_1FL_LOW_BREAK",
+        )
+        else ("DIP_1FL" if raw_tag == "DIP_1FL_LOW_BREAK" else raw_tag)
     )
     raw_portion_budget = safe_float(portion_budget, 0.0)
     if raw_portion_budget <= 0.0:
@@ -1485,15 +1657,31 @@ async def _commit_filled_buy_to_stratum_ledger(
                 f"{mode_cash_lbl} ${free_cash_now:,.2f} (총 {new_held_shares}주)"
             )
         elif was_l2_only and tag == "REENTRY_1FL" and len(new_buckets) >= 2:
+            if raw_tag == "REENTRY_1FL_LOW_BREAK":
+                re_mode_lbl = "1층공석 최저가 돌파"
+            elif raw_tag == "REENTRY_1FL_BREAKOUT":
+                re_mode_lbl = "1층공석 +1% 돌파"
+            else:
+                re_mode_lbl = "1층공석 -1% 눌림목"
             title_str = (
-                f"🔥 [SOXL 현재가 지정가 1층 재장전 체결] {q_int}주 @ ${fill_p:.2f} (상단 {u_cnt}개층 비병합)"
+                f"🔥 [SOXL {re_mode_lbl} 재장전 체결] {q_int}주 @ ${fill_p:.2f} (상단 {u_cnt}개층 비병합)"
             )
             body_str = (
                 f"실사용 ${actual_spent:,.2f} (자투리 +${saved_from_portion:.2f} 시드보존) · "
                 f"🛡️60초 타임쉴드 후 1층목표 ${l1_target:.2f}(+1.5%) 감시{rem_quota_note} · "
                 f"2~{new_held_tiers}층({u_qty}주) 이평 ${u_wma_p:.2f}(목표 ${u_wma_t:.2f}) 유지 · "
                 f"기억저가 ${new_cycle_min_p:.2f}{ratchet_note}(와이드 {drop_req_p:.1f}% 추매가 ${trig_buy_p:.2f}) · "
-                f"{mode_cash_lbl} ${free_cash_now:,.2f}"
+                f"{mode_cash_lbl} ${free_cash_now:,.2f} (총 {new_held_shares}주)"
+            )
+        elif raw_tag == "DIP_1FL_LOW_BREAK":
+            title_str = (
+                f"🔥 [SOXL 2층공석 최저가 돌파매수 체결 ({new_held_lots}회차{ratchet_note}/{new_held_tiers}개층)] {q_int}주 @ ${fill_p:.2f}"
+            )
+            body_str = (
+                f"구기억저가 ${old_min_p:.2f} 하향돌파 ➔ 신규기억저가 ${new_cycle_min_p:.2f} 갱신(공석 2층 슬롯 충전 완료) · "
+                f"실사용 ${actual_spent:,.2f} (자투리 +${saved_from_portion:.2f} 시드보존) · "
+                f"🛡️60초 타임쉴드 후 1층목표 ${l1_target:.2f} 감시{rem_quota_note} · 차기단차 {drop_req_p:.1f}%(${trig_buy_p:.2f}) · "
+                f"{mode_cash_lbl} ${free_cash_now:,.2f} (총 {new_held_shares}주)"
             )
         elif is_step_up_unlock_fill:
             reb_m = (
@@ -1574,11 +1762,18 @@ async def sync_pending_buy_order_plugin(
         str(st.get("pending_lot_type") or "QUOTA_L1").upper().strip()
     )
     is_sub_lot = raw_lot_type.startswith("SUB_")
-    if raw_lot_type in ("REENTRY_1FL_BREAKOUT", "REENTRY_1FL_PULLBACK"):
+    if raw_lot_type in (
+        "REENTRY_1FL_BREAKOUT",
+        "REENTRY_1FL_PULLBACK",
+        "REENTRY_1FL_LOW_BREAK",
+    ):
         lot_type = "REENTRY_1FL"
+    elif raw_lot_type == "DIP_1FL_LOW_BREAK":
+        lot_type = "DIP_1FL"
     elif raw_lot_type in (
         "SUB_REENTRY_1FL_BREAKOUT",
         "SUB_REENTRY_1FL_PULLBACK",
+        "SUB_REENTRY_1FL_LOW_BREAK",
     ):
         lot_type = "SUB_REENTRY_1FL"
     else:
@@ -1587,6 +1782,12 @@ async def sync_pending_buy_order_plugin(
     buckets_now = buckets_from_dicts(st.get("buckets", []))
     has_active_l1_now = has_active_l1_bucket(buckets_now)
     is_vacant_l1_now = bool(len(buckets_now) > 0 and not has_active_l1_now)
+    is_vacant_l2_lowbrk_now = bool(
+        not is_sub_lot
+        and raw_lot_type == "DIP_1FL_LOW_BREAK"
+        and len(buckets_now) > 0
+        and not has_active_l2_bucket(buckets_now)
+    )
     cur_target_q = max(0, safe_int(st.get("l1_target_quota_qty"), 0))
     fallback_target_q_on_zero_cancel = (
         max(buckets_now[0].qty, cur_target_q) if has_active_l1_now else 0
@@ -1612,6 +1813,7 @@ async def sync_pending_buy_order_plugin(
         not is_sub_lot
         and is_vacant_l1_now
         and lot_type == "REENTRY_1FL"
+        and raw_lot_type != "REENTRY_1FL_LOW_BREAK"
         and (
             raw_lot_type == "REENTRY_1FL_BREAKOUT"
             or (
@@ -1633,6 +1835,7 @@ async def sync_pending_buy_order_plugin(
         is_sub_lot
         and is_sub_vacant_l1_now
         and lot_type == "SUB_REENTRY_1FL"
+        and raw_lot_type != "SUB_REENTRY_1FL_LOW_BREAK"
         and (
             raw_lot_type == "SUB_REENTRY_1FL_BREAKOUT"
             or (
@@ -1684,7 +1887,7 @@ async def sync_pending_buy_order_plugin(
                 filled_qty=eff_q,
                 avg_fill_price=eff_p,
                 portion_budget=portion_budget,
-                lot_type=lot_type,
+                lot_type=raw_lot_type,
                 settled_order_id=buy_oid,
                 ordered_qty=ordered_qty,
             )
@@ -1751,7 +1954,7 @@ async def sync_pending_buy_order_plugin(
                         filled_qty=filled_q,
                         avg_fill_price=eff_p,
                         portion_budget=portion_budget,
-                        lot_type=lot_type,
+                        lot_type=raw_lot_type,
                         settled_order_id=buy_oid,
                         ordered_qty=ordered_qty,
                     )
@@ -1767,7 +1970,10 @@ async def sync_pending_buy_order_plugin(
                 mark_reentry_monitor_60s_cycle_shield(
                     context=context, symbol=TARGET_SYMBOL, eval_price=ord_price
                 )
-                if (is_vacant_l1_now and not is_sub_lot)
+                if (
+                    (is_vacant_l1_now and not is_sub_lot)
+                    or is_vacant_l2_lowbrk_now
+                )
                 else safe_float(st.get("last_reentry_eval_ts"), 0.0)
             )
             sub_re_epoch = (
@@ -1861,7 +2067,7 @@ async def sync_pending_buy_order_plugin(
                     filled_qty=(f_qty if f_qty > 0 else ordered_qty),
                     avg_fill_price=(f_avg if f_avg > 0.0 else ord_price),
                     portion_budget=portion_budget,
-                    lot_type=lot_type,
+                    lot_type=raw_lot_type,
                     settled_order_id=buy_oid,
                     ordered_qty=ordered_qty,
                 )
@@ -1875,7 +2081,10 @@ async def sync_pending_buy_order_plugin(
             mark_reentry_monitor_60s_cycle_shield(
                 context=context, symbol=TARGET_SYMBOL, eval_price=ord_price
             )
-            if (is_vacant_l1_now and not is_sub_lot)
+            if (
+                (is_vacant_l1_now and not is_sub_lot)
+                or is_vacant_l2_lowbrk_now
+            )
             else safe_float(st.get("last_reentry_eval_ts"), 0.0)
         )
         sub_re_epoch = (

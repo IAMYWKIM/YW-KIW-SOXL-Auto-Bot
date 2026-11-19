@@ -268,6 +268,16 @@ def load_view():
     age = br.newest_candle_age_min("SOXL")
     if age is not None:
         L.append(f"최신 1분봉: {age:+.1f}분 전 · 분봉 시간대 {'KST' if br._tz() is store.KST else 'ET'}")
+    try:
+        g = br._guard()
+        L.append(f"이상 가격 필터: {'🟢 ON' if g.enabled else '🔴 OFF'} · 현재가 보정 {g.stats['fixed']:,}/{g.stats['checked']:,}건"
+                 f" · 버린 체결틱 {g.stats['tick_dropped']:,}건")
+        if g.last_fix:
+            sym, raw, fx, bid, ask, ts = g.last_fix
+            L.append(f"  최근 보정: {sym} {raw:.2f} → {fx:.2f} (호가 {bid:.2f}/{ask:.2f}, "
+                     f"{datetime.fromtimestamp(ts, store.KST):%m-%d %H:%M:%S})")
+    except Exception:
+        pass
     if br.last_error:
         L.append(f"최근 오류: {br.last_error[:200]}")
     return "\n".join(L), _back("kx:load")

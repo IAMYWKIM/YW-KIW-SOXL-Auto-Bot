@@ -97,6 +97,7 @@ class TossBridge:
         self._cache = {}                                 # key → (mono_ts, value)
         self._c1m = {}                                   # symbol → {naive_ts: bar}
         self._c1m_refreshed = {}                         # symbol → mono
+        self._c1m_raw = {}                               # symbol → {key: (o,h,l,c)} 분봉 원본값 (이상 가격 필터용)
         self._chart_tz = None                            # 감지된 분봉 시간대
         self._locks = {}
         self._seq = 0
@@ -204,10 +205,51 @@ class TossBridge:
         return {}
 
     # ══ 시세 ══════════════════════════════════════════════════════════
+    def _guard(self):
+        """이상 가격 필터 (price_guard.py). 설정이 바뀌면 다시 만듭니다."""
+        from price_guard import PriceGuard
+        cfg = (bool(self._k("PRICE_GUARD_ENABLED", True)), float(self._k("PRICE_GUARD_BAND_PCT", 0.5)),
+               float(self._k("PRICE_GUARD_BAR_BAND_PCT", 2.0)))
+        g = getattr(self, "_pg", None)
+        if g is None or getattr(self, "_pg_cfg", None) != cfg:
+            old = g
+            g = PriceGuard(band_pct=cfg[1], bar_band_pct=cfg[2], enabled=cfg[0])
+            if old is not None:
+                g.last_ok, g.minute_range, g.stats = old.last_ok, old.minute_range, old.stats
+            self._pg, self._pg_cfg = g, cfg
+        return g
+
+    async def _best_bid_ask(self, sym: str, ttl: float):
+        ob = await self._cached(f"ob:{sym}", ttl, self.kiw.orderbook, sym)
+        bid = ob["bids"][0]["price"] if ob.get("bids") else 0.0
+        ask = ob["asks"][0]["price"] if ob.get("asks") else 0.0
+        return ob, bid, ask
+
     async def quote(self, symbol: str) -> dict:
+        """현재가. 실측상 키움 현재가에는 호가와 동떨어진 값이 섞이므로(price_guard.py) 호가 TR(usa20101)의
+        현재가를 1호가 범위로 검증해 씁니다. 전일종가 등 느린 항목은 현재가 TR(usa20100)을 5초 캐시로 받습니다."""
         sym = symbol.upper()
-        ttl = self._k("PRICE_CACHE_SEC", 0.35) if sym in ("SOXL",) else self._k("REF_PRICE_CACHE_SEC", 5.0)
-        return await self._cached(f"q:{sym}", float(ttl), self.kiw.quote, sym)
+        ttl = float(self._k("PRICE_CACHE_SEC", 0.35) if sym in ("SOXL",) else self._k("REF_PRICE_CACHE_SEC", 5.0))
+        g = self._guard()
+        if not g.enabled:
+            return await self._cached(f"q:{sym}", ttl, self.kiw.quote, sym)
+        base = await self._cached(f"q:{sym}", max(ttl, 5.0), self.kiw.quote, sym)
+        try:
+            ob, bid, ask = await self._best_bid_ask(sym, ttl)
+        except KiwoomApiError as e:
+            log.debug("호가 조회 실패 %s (현재가만으로 검증): %s", sym, e)
+            ob, bid, ask = {}, 0.0, 0.0
+            base = await self._cached(f"q:{sym}", ttl, self.kiw.quote, sym)
+        raw = float(ob.get("price") or 0.0) or float(base.get("price") or 0.0)
+        mk = datetime.now(self._tz()).strftime("%Y%m%d%H%M00")
+        px = g.check(sym, raw, bid, ask, mk)
+        if px != raw:
+            now = time.monotonic()
+            if now - getattr(self, "_pg_logged", 0.0) > 60:
+                self._pg_logged = now
+                log.warning("이상 가격 보정 %s: 키움 현재가 %.4f → %.4f (매수1호가 %.4f / 매도1호가 %.4f, 누적 %d건)",
+                            sym, raw, px, bid, ask, g.stats["fixed"])
+        return {**base, "price": px, "raw_price": raw, "bid": bid, "ask": ask}
 
     async def _r_prices(self, params, body):
         out = []
@@ -233,6 +275,13 @@ class TossBridge:
         sym = _s(params.get("symbol")).upper() or "SOXL"
         cnt = max(1, min(50, int(float(params.get("count") or 50))))
         rows = await self._cached(f"tk:{sym}", 0.3, self.kiw.ticks, sym)
+        g = self._guard()
+        bid = ask = 0.0
+        if g.enabled:
+            try:
+                _, bid, ask = await self._best_bid_ask(sym, 0.35)
+            except KiwoomApiError:
+                pass
         tz = self._tz()
         now_l = datetime.now(tz)
         out = []
@@ -240,6 +289,8 @@ class TossBridge:
             hms = split_hms(r["tm"])
             if r["price"] <= 0 or hms is None:
                 continue          # 시각 형식이 이상한 행은 버립니다 (엔진은 5초 이내 체결만 사용)
+            if not g.tick_ok(r["price"], bid, ask):
+                continue          # 호가 범위를 벗어난 체결(실측: 프리장에 1~4% 동떨어진 값 혼입)은 버립니다
             _, hh, mm, ss = hms   # 24시 이상(자정 넘긴 주간거래)은 오늘 날짜의 0시대로
             dt = now_l.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             if dt > now_l + timedelta(minutes=2):
@@ -358,6 +409,8 @@ class TossBridge:
             self._detect_chart_tz(rows)
             tz = self._tz()
             end_label = bool(self._k("CANDLE_TIME_IS_END", False))
+            raw_ = self._c1m_raw.setdefault(sym, {})
+            meta, touched = {}, []
             for r in rows:
                 c = anum(r.get("cur_prc"))
                 naive = parse_ts14(_s(r.get("cntr_tm")))     # 24시 이상 표기(자정 넘긴 주간거래)도 실제 시각으로
@@ -368,14 +421,23 @@ class TossBridge:
                     dt -= timedelta(minutes=1)
                 key = dt.strftime("%Y%m%d%H%M%S")
                 o = anum(r.get("open_pric")) or c
-                store_[key] = {"timestamp": _iso_kst(dt), "openPrice": f"{o:.4f}",
-                               "highPrice": f"{max(anum(r.get('high_pric')) or c, o, c):.4f}",
-                               "lowPrice": f"{min(anum(r.get('low_pric')) or c, o, c):.4f}",
-                               "closePrice": f"{c:.4f}", "volume": str(int(anum(r.get("trde_qty")))),
-                               "currency": "USD"}
+                raw_[key] = (o, max(anum(r.get("high_pric")) or c, o, c), min(anum(r.get("low_pric")) or c, o, c), c)
+                meta[key] = (_iso_kst(dt), str(int(anum(r.get("trde_qty")))))
+                touched.append(key)
+            # 이상 가격 필터: 이번에 받은 봉 + 그 앞 5봉(뒤 봉이 생기면 중앙값이 달라지므로)을 다시 계산
+            order_ = sorted(raw_)
+            if touched:
+                i0 = max(0, order_.index(min(touched)) - 5)
+                redo = [k for k in order_[i0:] if k in store_ or k in meta]
+                for key, (o, h, l, c) in self._guard().fix_bars(sym, raw_, redo).items():
+                    ts, vol = meta.get(key) or (store_[key]["timestamp"], store_[key]["volume"])
+                    store_[key] = {"timestamp": ts, "openPrice": f"{o:.4f}", "highPrice": f"{h:.4f}",
+                                   "lowPrice": f"{l:.4f}", "closePrice": f"{c:.4f}", "volume": vol,
+                                   "currency": "USD"}
             if len(store_) > 2400:                     # 메모리 상한: 최근 봉만 유지
                 for k in sorted(store_)[:-2000]:
                     store_.pop(k, None)
+                    raw_.pop(k, None)
             self._c1m_refreshed[sym] = time.monotonic()
             return store_
 

@@ -72,6 +72,7 @@ ERROR_HINTS = {
     "8104": "모의투자에서 지원하지 않는 API 입니다 — 해외주식 모의투자 신청 여부를 확인하거나 DRY_RUN 으로 시험하세요",
     "8200": "법인 계좌는 이 API를 쓸 수 없습니다",
     "7": "키움 서버 일시 오류입니다 — 봇이 자동 재시도하고 직전 값으로 이어 갑니다 (계속되면 키움 점검 시간 여부 확인)",
+    "20": "키움 내부 중계 서버 일시 실패(-994 fail to sendReceive) — 봇이 자동 재시도합니다. 같은 오류가 몇 분 이상 계속되면 키움 점검·장애 여부 확인",
     "1700": "호출 한도 초과 — KIWOOM.QUERY_MIN_INTERVAL 을 0.34 로",
     "1903": "종목코드/거래소구분이 맞지 않습니다 — config.json SYMBOLS 확인",
     "1504": "이 주소에서 지원하지 않는 API ID 입니다",
@@ -79,8 +80,8 @@ ERROR_HINTS = {
 }
 
 
-TRANSIENT_CODES = {"7", "1999", "1687"}
-TRANSIENT_WORDS = ("처리하는 중에 오류", "[1631]", "예기치 못한", "일시적", "잠시 후")
+TRANSIENT_CODES = {"7", "20", "1999", "1687"}   # 20: 실측(2026-11-18) [2000](-994:fail to sendReceive) 키움 내부 중계 실패
+TRANSIENT_WORDS = ("처리하는 중에 오류", "[1631]", "예기치 못한", "일시적", "잠시 후", "fail to sendReceive", "(-994")
 
 
 def is_transient(code, msg: str = "", http_status: int = 200) -> bool:
@@ -195,6 +196,7 @@ class KiwoomUsClient:
         self._session = requests.Session()
         self._token = None
         self._token_expire = datetime.min
+        self._rejected_token = None
         self._lock = threading.RLock()
         self._last_query = 0.0
         self._last_order = 0.0
@@ -207,12 +209,49 @@ class KiwoomUsClient:
         self._stat_day = ""
 
     # ── 인증 ───────────────────────────────────────────────────
+    # ── 토큰 공유 파일 (v1.0.10) ─────────────────────────────
+    # 같은 앱키로 토큰을 새로 받으면 앞서 받은 토큰이 무효(8005)가 될 수 있어,
+    # 봇·diag·기록 스크립트 등 이 폴더의 모든 프로세스가 토큰 하나를 파일로 함께 씁니다.
+    def _token_file(self):
+        import hashlib
+        h = hashlib.sha256(f"{self.base}|{self.app_key}".encode()).hexdigest()[:12]
+        return config.DATA_DIR / f"kiwoom_token_{h}.json"
+
+    def _load_shared_token(self, reject: str = ""):
+        try:
+            import json as _j
+            d = _j.loads(self._token_file().read_text(encoding="utf-8"))
+            tok, exp = str(d.get("token") or ""), datetime.strptime(d.get("expire", ""), "%Y%m%d%H%M%S")
+            if tok and tok != reject and exp > datetime.now():
+                return tok, exp
+        except Exception:
+            pass
+        return None, None
+
+    def _save_shared_token(self):
+        try:
+            import json as _j, os as _os
+            f = self._token_file()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(_j.dumps({"token": self._token, "expire": self._token_expire.strftime("%Y%m%d%H%M%S"),
+                                     "pid": _os.getpid()}), encoding="utf-8")
+            _os.chmod(tmp, 0o600)
+            _os.replace(tmp, f)
+        except Exception as e:
+            log.debug("토큰 공유 파일 저장 실패: %s", e)
+
     def _ensure_token(self) -> str:
         with self._lock:
             if self._token and datetime.now() < self._token_expire:
                 return self._token
             if not self.app_key or not self.secret_key:
                 raise KiwoomApiError("au10001", "NO_KEY", "키움 앱키/시크릿키가 비어 있습니다 (.env 확인)")
+            tok, exp = self._load_shared_token(reject=self._rejected_token or "")
+            if tok:                                   # 다른 프로세스가 받아 둔 유효한 토큰을 그대로 사용
+                self._token, self._token_expire = tok, exp
+                log.info("공유 토큰 사용 (만료 %s)", exp.strftime("%m-%d %H:%M"))
+                return tok
             r = self._session.post(
                 f"{self.base}/oauth2/token",
                 json={"grant_type": "client_credentials", "appkey": self.app_key, "secretkey": self.secret_key},
@@ -236,10 +275,13 @@ class KiwoomUsClient:
             self._token_expire = exp if exp and exp > datetime.now() else datetime.now() + timedelta(hours=6)
             log.info("액세스 토큰 발급 완료 (mock=%s, 만료 %s)", config.KIWOOM_IS_MOCK,
                      self._token_expire.strftime("%m-%d %H:%M"))
+            self._rejected_token = None
+            self._save_shared_token()
             return self._token
 
     def invalidate_token(self):
         with self._lock:
+            self._rejected_token = self._token     # 방금 거부된 토큰은 공유 파일에 있어도 다시 쓰지 않음
             self._token = None
 
     # ── 공통 요청 ─────────────────────────────────────────────
@@ -292,8 +334,11 @@ class KiwoomUsClient:
                     data = {"return_code": -1, "return_msg": f"JSON 아님: {r.text[:120]}"}
                 rc = data.get("return_code")
                 msg = str(data.get("return_msg") or "")
-                # 토큰 만료: HTTP 401 또는 return_code 8005 / 메시지 [8005:...] → 1회 재발급 후 재시도
-                if not token_retried and (status == 401 or str(rc) == "8005" or "8005" in msg[:12]):
+                # 토큰 무효: HTTP 401, return_code 8005, 또는 메시지 안의 [8005:...] → 1회 재발급 후 재시도
+                # (실측 2026-11-18: return_code=3, "인증에 실패했습니다[8005:Token이 유효하지 않습니다]".
+                #  v1.0.9 까지는 메시지 앞 12글자만 봐서 이 형태를 놓쳐 재발급하지 못했음)
+                if not token_retried and (status == 401 or str(rc) == "8005" or "8005" in msg
+                                          or ("인증에 실패" in msg and "Token" in msg)):
                     token_retried = True
                     self.invalidate_token()
                     continue
